@@ -2,22 +2,22 @@
 set -u
 
 # ==============================================================================
-# llamatop.sh — Jan / llama.cpp router monitor
+# llamatop.sh — llama.cpp router monitor
 #
 # Normal:
-#   ~/llamatop.sh http://127.0.0.1:6767 jan 2
+#   ~/llamatop.sh http://127.0.0.1:6767 'YOUR_API_KEY' 2
 #
 # Compact:
-#   SHOW_ALL_METRICS=0 ~/llamatop.sh http://127.0.0.1:6767 jan 2
+#   SHOW_ALL_METRICS=0 ~/llamatop.sh http://127.0.0.1:6767 'YOUR_API_KEY' 2
 #
 # Exact raw endpoint dump:
-#   ~/llamatop.sh http://127.0.0.1:6767 jan 2 --raw
+#   ~/llamatop.sh http://127.0.0.1:6767 'YOUR_API_KEY' 2 --raw
 #
 # Repeated raw endpoint dump:
-#   ~/llamatop.sh http://127.0.0.1:6767 jan 2 --raw-watch
+#   ~/llamatop.sh http://127.0.0.1:6767 'YOUR_API_KEY' 2 --raw-watch
 #
 # Pin model instead of auto-detect:
-#   ~/llamatop.sh http://127.0.0.1:6767 jan 2 Qwen3_8-27B-UD-Q6_K_XL
+#   ~/llamatop.sh http://127.0.0.1:6767 'YOUR_API_KEY' 2 Qwen3_8-27B-UD-Q6_K_XL
 #
 # Dashboard keys:
 #   q = quit, j/k = scroll when the dashboard is taller than the terminal
@@ -942,7 +942,7 @@ while true; do
 
     FRAME="$(
     echo '════════════════════════════════════════════════════════════════════════════════'
-    printf ' llamatop — Jan / llama.cpp                    %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf ' llamatop — llama.cpp                          %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     echo '════════════════════════════════════════════════════════════════════════════════'
     printf ' Model                %s  [%s]\n Server               %s\n State                %s\n' "$MODEL" "$MODEL_MODE" "$BASE" "$REQUEST_STATE"
 

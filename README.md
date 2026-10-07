@@ -1,11 +1,11 @@
 # llamatop
 
-A small terminal monitor for **Jan and llama.cpp routers**.
+A small terminal monitor for **llama.cpp**.
 
-Watch decode speed, prefill, context usage, and speculative decoding from one Bash script. It polls your server's HTTP endpoints and follows the model doing the work.
+Watch decode speed, prefill, context usage, and speculative decoding from one Bash script. It polls llama.cpp's router endpoints and follows the model doing the work.
 
 ```text
-llamatop — Jan / llama.cpp
+llamatop — llama.cpp
 
 Model                 Qwen3_8-27B-UD-Q6_K_XL  [auto]
 State                 DECODE
@@ -125,7 +125,7 @@ Bodies appear between markers; the newline before each end marker belongs to the
 | `401` | API key and server authentication settings. |
 | `404` | Base URL, model ID, and whether the server exposes these router endpoints. |
 | `501` | The response body identifies an unsupported or disabled endpoint. Enable the corresponding server feature if available. |
-| No loaded model | Load one in Jan / your router, or specify the intended model ID. |
+| No loaded model | Load a model in your router, or specify the intended model ID. |
 | MTP shows `n/a` | The server has not exposed those counters. Speculation can be enabled without those metrics being available. |
 | Zero prefill rate during decode | Prefill has finished. Check the prefill token count, history, and counter scope. |
 
