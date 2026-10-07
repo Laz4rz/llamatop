@@ -24,7 +24,7 @@ q = quit · j/k = scroll
 - **Live decode** from slot token deltas, with sparklines and min/max rates.
 - **Current context** on a fixed 0–100% bar, separate from the high-water mark.
 - **Automatic model selection**, or pin a specific model.
-- **Stable terminal updates** that redraw only changed rows and handle resizing.
+- **Stable terminal updates** with responsive scrolling, even during slow server requests.
 - **Exact raw responses** for debugging API errors and server differences.
 
 ## Quick start
@@ -75,7 +75,7 @@ SHOW_ALL_METRICS=0 ./llamatop.sh http://127.0.0.1:6767 'YOUR_API_KEY' 0.2
 HISTORY_LEN=60 ./llamatop.sh http://127.0.0.1:6767 'YOUR_API_KEY' 0.5
 ```
 
-Dashboard controls: **`q`** quits; **`j` / `k`** scroll when the display is taller than the terminal. Widen the terminal if a row is clipped. `Ctrl+C` also exits, including in raw-watch mode.
+Dashboard controls: **`q`** quits; **`j` / `k`** scroll one row at a time when the display is taller than the terminal. Hold either key to keep scrolling. Input and resizing work independently of the polling interval and server response time. Widen the terminal if a row is clipped. `Ctrl+C` also exits, including in raw-watch mode.
 
 With multiple loaded models, the dashboard prefers one with an active slot. When all are idle, it stays with the previously selected model if still loaded. Requests to `/slots` and `/metrics` include `autoload=false`.
 

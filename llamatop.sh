@@ -72,8 +72,14 @@ done
 
 TMP_DIR="$(mktemp -d)"
 ALT_SCREEN=0
+poller_pid=""
 
 cleanup() {
+    if [[ -n "$poller_pid" ]]; then
+        # The sampler owns its process group, including in-flight curl/jq/sleep.
+        kill -TERM -- "-$poller_pid" 2>/dev/null || true
+        wait "$poller_pid" 2>/dev/null || true
+    fi
     if [[ "$ALT_SCREEN" == "1" ]]; then
         # Release synchronized output / wrapping even if interrupted mid-frame.
         printf '\033[?2026l\033[?7h'
@@ -189,7 +195,6 @@ select_dashboard_model() {
     for candidate in "${candidates[@]}"; do
         [[ -n "${visited[$candidate]:-}" ]] && continue
         visited["$candidate"]=1
-        check_keypress
         http_get "$BASE/slots?model=$(urlencode "$candidate")&autoload=false"
         local probe_ts
         probe_ts="$(date +%s.%N)"
@@ -626,55 +631,92 @@ endpoint_error() {
 }
 
 # ==============================================================================
-# Keyboard
+# Keyboard / display event loop
 # ==============================================================================
 
-check_keypress() {
-    local key=""
-
-    if read -rsn1 -t 0.01 key 2>/dev/null; then
+read_keys() {
+    local max_scroll="$1" key="" status count=0
+    # Wait for input instead of sleeping after each key. Drain a bounded burst
+    # of repeats and redraw once, so queued input never triggers stale frames.
+    IFS= read -rsn1 -t 0.016 key 2>/dev/null
+    status=$?
+    while (( status == 0 )); do
         case "$key" in
             q|Q)
                 exit 0
                 ;;
             j)
-                ((scroll_offset+=3))
-                [[ -n "$last_frame" ]] && present_frame "$last_frame"
+                ((scroll_offset < max_scroll)) && ((scroll_offset+=1))
                 ;;
             k)
-                ((scroll_offset-=3))
-                [[ -n "$last_frame" ]] && present_frame "$last_frame"
+                ((scroll_offset > 0)) && ((scroll_offset-=1))
                 ;;
         esac
-    fi
+        ((++count >= 64)) && break
+        IFS= read -r -t 0 2>/dev/null || break
+        IFS= read -rsn1 -t 0.001 key 2>/dev/null
+        status=$?
+    done
+    # Closed/non-interactive stdin must not turn the display into a busy loop.
+    (( status == 1 )) && sleep 0.016
+    return 0
 }
 
-responsive_sleep() {
-    local total="$1"
-    local elapsed=0
-    local step=0.1
+publish_frame() {
+    # Only the display process writes to the terminal. NUL separates complete
+    # frames on the pipe without changing newlines inside a frame.
+    printf '%s\0' "$1"
+}
 
-    while awk -v e="$elapsed" -v t="$total" \
-        'BEGIN { exit !(e < t) }'
-    do
-        check_keypress
-        sleep "$step"
-
-        elapsed="$(
-            awk -v e="$elapsed" -v s="$step" '
-                BEGIN { printf "%.2f", e+s }
-            '
-        )"
+display_loop() {
+    local chunk="" pending="" status redraw old_offset max_scroll=0
+    local -a frame_lines=()
+    while true; do
+        redraw=0
+        # read keeps partial input on timeout; retain it until the NUL arrives.
+        # A large frame must not block keyboard input while its bytes arrive.
+        # Byte mode also preserves UTF-8 characters split across timed reads.
+        if IFS= read -r -t 0 -u "$poll_fd"; then
+            LC_ALL=C IFS= read -r -d '' -t 0.001 -u "$poll_fd" chunk
+            status=$?
+            pending+="$chunk"
+            if (( status == 0 )); then
+                last_frame="$pending"
+                pending=""
+                mapfile -t frame_lines <<< "$last_frame"
+                redraw=1
+            elif (( status == 1 )); then
+                wait "$poller_pid"
+                status=$?
+                printf '\nDashboard polling stopped (exit %s).\n' "$status" >&2
+                return 1
+            fi
+        fi
+        max_scroll=0
+        if (( ${#frame_lines[@]} > ${LINES:-24} )); then
+            max_scroll=$((${#frame_lines[@]} - ${LINES:-24} + 1))
+        fi
+        old_offset=$scroll_offset
+        read_keys "$max_scroll"
+        if (( resize_pending )); then
+            resize_pending=0
+            sleep 0
+        fi
+        if [[ -n "$last_frame" ]] && {
+            (( redraw || scroll_offset != old_offset )) ||
+            { [[ -t 1 ]] && (( ${LINES:-24} != last_frame_rows || ${COLUMNS:-80} != last_frame_cols )); }
+        }; then
+            present_frame "$last_frame"
+        fi
     done
 }
 
 # ==============================================================================
-# Main loop
+# Sampling loop (runs independently of keyboard input and terminal rendering)
 # ==============================================================================
 
+poll_dashboard() {
 while true; do
-    check_keypress
-
     http_get "$BASE/models"
     MODELS="$HTTP_BODY"
     MODELS_CODE="$HTTP_CODE"
@@ -691,10 +733,10 @@ while true; do
             [[ "$MODELS_CODE" == "200" ]] && echo 'Expected a /models object containing a data array.'
             echo 'q = quit'
             )"
-            present_frame "$FRAME"
+            publish_frame "$FRAME"
             prev_slots='[]'
             last_sample_ts=""
-            responsive_sleep "$INTERVAL"
+            sleep "$INTERVAL"
             continue
         fi
     fi
@@ -710,10 +752,10 @@ while true; do
         ' <<< "$MODELS"
         echo 'Waiting...  q = quit'
         )"
-        present_frame "$FRAME"
+        publish_frame "$FRAME"
         prev_slots='[]'
         last_sample_ts=""
-        responsive_sleep "$INTERVAL"
+        sleep "$INTERVAL"
         continue
     fi
 
@@ -1001,6 +1043,27 @@ while true; do
     echo
     echo ' q = quit   |   --raw = exact endpoint bodies   |   n/a = unavailable'
     )"
-    present_frame "$FRAME"
-    responsive_sleep "$INTERVAL"
+    publish_frame "$FRAME"
+    sleep "$INTERVAL"
 done
+}
+
+# Job control gives the sampler its own process group so quit can cancel its
+# children immediately. Only this brief launch uses it; neither loop needs it.
+set -m
+coproc SAMPLER {
+    trap - EXIT INT TERM
+    set +m
+    poll_dashboard
+} </dev/null
+poller_pid=$SAMPLER_PID
+exec {poll_fd}<&"${SAMPLER[0]}"
+poll_input=${SAMPLER[1]}
+exec {poll_input}>&-
+set +m
+
+# checkwinsize refreshes LINES/COLUMNS after external commands. The display
+# loop otherwise uses builtins, so trigger that refresh only on a resize.
+resize_pending=0
+trap 'resize_pending=1' WINCH
+display_loop
