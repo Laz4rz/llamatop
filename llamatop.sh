@@ -913,61 +913,67 @@ while true; do
 
     printf '%*s\n' 94 '' | tr ' ' '-'
 
-    jq -r '
-        def nt:
-            if (.next_token | type) == "array" then
-                (.next_token[0] // {})
-            elif (.next_token | type) == "object" then
-                .next_token
-            else
-                {}
-            end;
+jq -r '
+    def nt:
+        if (.next_token | type) == "array" then
+            (.next_token[0] // {})
+        elif (.next_token | type) == "object" then
+            .next_token
+        else
+            {}
+        end;
 
-        .[] |
+    def r3:
+        if type == "number"
+        then ((. * 1000 | round) / 1000)
+        else .
+        end;
 
-        [
-            (.id // "?"),
+    .[] |
 
-            (
-                if .is_processing
-                then "RUNNING"
-                else "idle"
-                end
-            ),
+    [
+        (.id // "?"),
 
-            (.id_task // "-"),
+        (
+            if .is_processing
+            then "RUNNING"
+            else "idle"
+            end
+        ),
 
-            (.n_ctx // "-"),
+        (.id_task // "-"),
 
-            (
-                if .speculative
-                then "yes"
-                else "no"
-                end
-            ),
+        (.n_ctx // "-"),
 
-            (nt | .n_decoded // 0),
+        (
+            if .speculative
+            then "yes"
+            else "no"
+            end
+        ),
 
-            (nt | .n_remain // "-"),
+        (nt | .n_decoded // 0),
 
-            (
-                .params.max_tokens
-                // .params.n_predict
-                // "-"
-            ),
+        (nt | .n_remain // "-"),
 
-            (.params.temperature // "-"),
+        (
+            .params.max_tokens
+            // .params.n_predict
+            // "-"
+        ),
 
-            (.params.top_p // "-"),
+        (.params.temperature // "-" | r3),
 
-            (
-                .params["speculative.n_max"]
-                // "-"
-            )
-        ]
+        (.params.top_p // "-" | r3),
 
-        | @tsv
-    ' <<< "$SLOTS" |
+        (
+            .params["speculative.n_max"]
+            // "-"
+        )
+    ]
+
+    | @tsv
+' <<< "$SLOTS" |
 
     while IFS=$'\t' read -r \
         id \
