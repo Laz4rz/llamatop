@@ -160,6 +160,51 @@ detect_model() {
     ' <<< "$models" 2>/dev/null
 }
 
+# /models reports which models are loaded, not which one is answering. In a
+# router with multiple loaded models, prefer an active /slots response. Keep
+# following the previously selected model when all models are idle.
+select_dashboard_model() {
+    PROBED_SLOTS=0
+    MODEL="$(detect_model "$MODELS")"
+    [[ -n "$PINNED_MODEL" || -z "$MODEL" ]] && return
+    local -a candidates=()
+    local candidate probe fallback="$MODEL"
+    mapfile -t candidates < <(jq -r '
+        .data[]? | objects |
+        select((.status | if type == "object" then .value else . end) == "loaded") |
+        .id | select(type == "string" and length > 0)
+    ' <<< "$MODELS")
+    (( ${#candidates[@]} <= 1 )) && return
+    # Prefer the current model if more than one model is busy.
+    for candidate in "${candidates[@]}"; do
+        if [[ "$candidate" == "$last_model" ]]; then
+            fallback="$candidate"
+            candidates=("$candidate" "${candidates[@]}")
+            break
+        fi
+    done
+    local -A visited=()
+    for candidate in "${candidates[@]}"; do
+        [[ -n "${visited[$candidate]:-}" ]] && continue
+        visited["$candidate"]=1
+        check_keypress
+        http_get "$BASE/slots?model=$(urlencode "$candidate")&autoload=false"
+        local probe_ts
+        probe_ts="$(date +%s.%N)"
+        [[ "$HTTP_CODE" != "200" || "$HTTP_RC" != "0" ]] && continue
+        if probe="$(normalize_slots <<< "$HTTP_BODY" 2>/dev/null)" &&
+           jq -e 'any(.[]; .active == true)' >/dev/null <<< "$probe"
+        then
+            MODEL="$candidate"
+            PROBED_SLOTS=1
+            PROBED_SLOTS_BODY="$HTTP_BODY"
+            PROBED_SLOTS_TS="$probe_ts"
+            return
+        fi
+    done
+    MODEL="$fallback"
+}
+
 # Raw bodies must come directly from curl's file. Command substitution strips
 # trailing newlines, and Bash variables cannot preserve NUL bytes.
 print_raw_response() {
@@ -269,6 +314,7 @@ last_sample_ts=""
 
 # Live slot state from previous poll
 prev_slots='[]'
+remembered_requests='[]'
 
 # ==============================================================================
 # History / sparkline
@@ -277,6 +323,10 @@ prev_slots='[]'
 reset_histories() {
     gen_hist=()
     prompt_hist=()
+    gen_min='n/a'
+    gen_max='n/a'
+    prompt_min='n/a'
+    prompt_max='n/a'
 
     local i
 
@@ -299,6 +349,24 @@ push_hist() {
     while (( ${#arr[@]} > HISTORY_LEN )); do
         arr=("${arr[@]:1}")
     done
+}
+
+# Track positive observed rates for the selected model. Idle zeros, startup
+# baselines, missing measurements and sparkline padding are not measurements
+# of prefill/decode performance, so they must not become the minimum.
+update_rate_range() {
+    local value="$1"
+    local -n low="$2"
+    local -n high="$3"
+    IFS=$'\t' read -r low high < <(
+        awk -v value="$value" -v lo="$low" -v hi="$high" 'BEGIN {
+            if (value != "n/a" && value+0 > 0) {
+                if (lo == "n/a" || value+0 < lo+0) lo=value
+                if (hi == "n/a" || value+0 > hi+0) hi=value
+            }
+            printf "%s\t%s\n", lo, hi
+        }'
+    )
 }
 
 spark() {
@@ -439,6 +507,47 @@ normalize_slots() {
     '
 }
 
+# Preserve the last observed request in each slot when an idle response clears
+# its counters. These saved values are used only for the request summary, never
+# for live rates or current context occupancy.
+request_summary() {
+    jq -c --argjson remembered "$remembered_requests" --argjson ok "$SLOTS_OK" '
+        def has_tokens: any([.context, .evaluated, .cached, .decoded][]; . != null and . > 0);
+        def latest_counter($old; $new): [$old, $new] | map(select(. != null)) | max;
+        . as $slots |
+        (if $ok == 0 then $remembered else
+            reduce $slots[] as $now ($remembered;
+                ([.[] | select(.id == $now.id)][0]) as $old |
+                (if $now.active == true then $now
+                 elif $now.active == false then
+                    if $old == null then
+                        (if $now | has_tokens then
+                            $now | if .evaluated == 0 and .cached == 0 and .decoded == 0 then
+                                .evaluated = null | .cached = null | .decoded = null
+                            else . end
+                         else null end)
+                    elif $old.task != null and $now.task == $old.task then
+                        $old + {
+                            context: (if $now.context != null and $now.context > 0 then $now.context else $old.context end),
+                            evaluated: latest_counter($old.evaluated; $now.evaluated),
+                            cached: latest_counter($old.cached; $now.cached),
+                            decoded: latest_counter($old.decoded; $now.decoded)
+                        }
+                    elif $now.task != null and $now.task != "-1" and ($now | has_tokens) then $now
+                    else $old end
+                 else $old end) as $save |
+                if $save == null then . else [.[] | select(.id != $now.id)] + [$save] end
+            ) end) as $saved |
+        [$slots[] | select(.active == true)] as $active |
+        (if $ok == 0 then {visible: $saved, scope: "last observed requests; /slots unavailable"}
+         elif ($active | length) > 0 then {visible: $active, scope: "active requests"}
+         elif any($slots[]; .active == null) then {visible: $slots, scope: "reported slot counters; activity state unavailable"}
+         elif ($saved | length) > 0 then {visible: $saved, scope: "last observed request per slot (idle; not live)"}
+         else {visible: [], scope: "no request counters observed yet"} end)
+        + {saved: $saved}
+    '
+}
+
 endpoint_error() {
     printf '\nGET %s\nHTTP %s\n' "$1" "$2"
     [[ -n "$3" ]] && printf '%s\n' "$3"
@@ -510,7 +619,7 @@ while true; do
         fi
     fi
 
-    MODEL="$(detect_model "$MODELS")"
+    select_dashboard_model
     if [[ -z "$MODEL" ]]; then
         clear_screen
         printf 'llamatop    %s\nServer: %s\n\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$BASE"
@@ -533,6 +642,7 @@ while true; do
         reset_histories
         last_sample_ts=""
         prev_slots='[]'
+        remembered_requests='[]'
         last_model="$MODEL"
     fi
 
@@ -548,7 +658,18 @@ while true; do
     [[ "$METRICS_CODE" != "200" || "$HTTP_RC" != "0" ]] && METRICS_OK=0
 
     # A metrics error must not prevent independent live /slots monitoring.
-    http_get "$SLOTS_URL"
+    if [[ "$PROBED_SLOTS" == "1" ]]; then
+        # Reuse the active snapshot that selected this model. A second request
+        # could otherwise see cleared statistics from an already-finished task.
+        HTTP_BODY="$PROBED_SLOTS_BODY"
+        HTTP_CODE=200
+        HTTP_RC=0
+        HTTP_ERROR=""
+        SLOT_SAMPLE_TS="$PROBED_SLOTS_TS"
+    else
+        http_get "$SLOTS_URL"
+        SLOT_SAMPLE_TS="$(date +%s.%N)"
+    fi
     SLOTS_BODY="$HTTP_BODY"
     SLOTS_CODE="$HTTP_CODE"
     SLOTS_ERROR="$HTTP_ERROR"
@@ -562,9 +683,9 @@ while true; do
     fi
     [[ "$SLOTS_OK" == "0" ]] && SLOTS='[]'
 
-    # Timestamp slot samples immediately after receipt/parsing. Never derive a
+    # Timestamp slot samples at receipt, including reused routing probes. Never derive a
     # live rate from tokens_predicted_total or any other /metrics counter.
-    NOW_TS="$(date +%s.%N)"
+    NOW_TS="$SLOT_SAMPLE_TS"
     SAMPLE_DT="$INTERVAL"
     if [[ -n "$last_sample_ts" ]]; then
         SAMPLE_DT="$(awk -v n="$NOW_TS" -v o="$last_sample_ts" '
@@ -631,6 +752,21 @@ while true; do
         SLOT_PROMPT_DELTA SLOT_DECODED_DELTA CTX_CURRENT CTX_CAPACITY SLOT_COUNT SLOT_UNKNOWN_STATE \
         <<< "$SLOT_LIVE"
 
+    # Count display and rate measurements deliberately have separate lifetimes:
+    # idle means zero current throughput, not a request with zero input/output.
+    SUMMARY="$(request_summary <<< "$SLOTS")"
+    remembered_requests="$(jq -c '.saved' <<< "$SUMMARY")"
+    COUNTER_SCOPE="$(jq -r '.scope' <<< "$SUMMARY")"
+    SUMMARY_COUNTS="$(jq -r '
+        def sum_known:
+            if length == 0 or any(.[]; . == null) then null else add end;
+        .visible | [map(.evaluated) | sum_known] +
+            [map(.decoded) | sum_known] + [map(.context) | sum_known] +
+            [map(.cached) | sum_known]
+        | map(if . == null then "n/a" else tostring end) | @tsv
+    ' <<< "$SUMMARY")"
+    IFS=$'\t' read -r DISPLAY_PREFILL DISPLAY_DECODED DISPLAY_CONTEXT DISPLAY_CACHED <<< "$SUMMARY_COUNTS"
+
     PROMPT_LIVE="$(awk -v d="$SLOT_PROMPT_DELTA" -v t="$SAMPLE_DT" '
         BEGIN { if (d == "n/a" || t <= 0) printf "n/a"; else printf "%.2f", d/t }
     ')"
@@ -643,9 +779,9 @@ while true; do
     if [[ "$SLOTS_OK" == "0" || "$SLOT_UNKNOWN_STATE" == "1" || "$SLOT_COUNT" == "0" ]]; then
         REQUEST_STATE="UNKNOWN"
     elif (( SLOT_ACTIVE_COUNT > 0 )); then
-        if awk -v d="$SLOT_DECODED_DELTA" 'BEGIN { exit !(d != "n/a" && d+0 > 0) }'; then
+        if awk -v d="$SLOT_DECODED" 'BEGIN { exit !(d != "n/a" && d+0 > 0) }'; then
             REQUEST_STATE="DECODE"
-        elif awk -v d="$SLOT_PROMPT_DELTA" 'BEGIN { exit !(d != "n/a" && d+0 > 0) }'; then
+        elif awk -v d="$SLOT_PROMPT_PROCESSED" 'BEGIN { exit !(d != "n/a" && d+0 > 0) }'; then
             REQUEST_STATE="PREFILL"
         else
             REQUEST_STATE="PROCESSING"
@@ -677,6 +813,8 @@ while true; do
 
     push_hist gen_hist "$GEN_LIVE"
     push_hist prompt_hist "$PROMPT_LIVE"
+    update_rate_range "$GEN_LIVE" gen_min gen_max
+    update_rate_range "$PROMPT_LIVE" prompt_min prompt_max
 
     clear_screen
     echo '════════════════════════════════════════════════════════════════════════════════'
@@ -685,18 +823,24 @@ while true; do
     printf ' Model                %s  [%s]\n Server               %s\n State                %s\n' "$MODEL" "$MODEL_MODE" "$BASE" "$REQUEST_STATE"
 
     echo
-    echo '────────────────────────────── LIVE REQUEST ────────────────────────────────────'
+    echo '───────────────────────────── REQUEST MONITOR ──────────────────────────────────'
+    printf ' Active slots         %s / %s\n' "$SLOT_ACTIVE_COUNT" "$SLOT_COUNT"
     printf ' Decode live          %9s tok/s   ' "$GEN_LIVE"
     spark "${gen_hist[@]}"
+    printf '  min %s  max %s' "$gen_min" "$gen_max"
     printf '\n Prefill sampled      %9s tok/s   ' "$PROMPT_LIVE"
     spark "${prompt_hist[@]}"
-    printf '\n\n Context tokens       %9s  (active slots; includes generated tokens)\n' "$SLOT_CONTEXT"
-    printf ' Prefill tokens       %9s  (input tokens processed after cache reuse)\n' "$SLOT_PROMPT_PROCESSED"
-    printf ' Prompt cached/reused %9s  (explicit slot field, when available)\n' "$SLOT_CACHED"
-    printf ' Decoded tokens       %9s tokens in active requests\n' "$SLOT_DECODED"
+    printf '  min %s  max %s' "$prompt_min" "$prompt_max"
+    printf '\n                      Min/max: nonzero samples since model selection (tok/s).'
+    printf '\n\n Counter scope        %s\n' "$COUNTER_SCOPE"
+    printf ' Context tokens       %9s  (sequence count, including output tokens)\n' "$DISPLAY_CONTEXT"
+    printf ' Prefill tokens       %9s  (input tokens processed after cache reuse)\n' "$DISPLAY_PREFILL"
+    printf ' Prompt cached/reused %9s  (explicit slot field, when available)\n' "$DISPLAY_CACHED"
+    printf ' Decoded tokens       %9s\n' "$DISPLAY_DECODED"
     printf ' Sample delta         prefill=%s  decode=%s  over %.2fs\n' "$SLOT_PROMPT_DELTA" "$SLOT_DECODED_DELTA" "$SAMPLE_DT"
     echo '                      Prefill sampled = tokens observed per poll interval.'
     echo '                      Decode needs two samples of the same request.'
+    [[ "$SLOT_ACTIVE_COUNT" == "0" ]] && echo '                      Saved counts may omit final tokens between polls.'
 
     echo
     echo '──────────────────────────── /metrics AGGREGATE ────────────────────────────────'
