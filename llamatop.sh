@@ -358,13 +358,13 @@ spark() {
         max = min
 
         for (i = 1; i < ARGC; i++) {
-            v[i] = ARGV[i] + 0
+            vals[i] = ARGV[i] + 0
 
-            if (v[i] < min) min = v[i]
-            if (v[i] > max) max = v[i]
+            if (vals[i] < min) min = vals[i]
+            if (vals[i] > max) max = vals[i]
         }
 
-        # Entire window is zero.
+        # Entire history is zero
         if (min == 0 && max == 0) {
             for (i = 1; i < ARGC; i++)
                 printf "·"
@@ -375,12 +375,12 @@ spark() {
         range = max - min
 
         for (i = 1; i < ARGC; i++) {
-            v = ARGV[i] + 0
+            x = vals[i]
 
             if (range == 0)
                 idx = 3
             else
-                idx = int(((v - min) / range) * 7)
+                idx = int(((x - min) / range) * 7)
 
             if (idx < 0) idx = 0
             if (idx > 7) idx = 7
