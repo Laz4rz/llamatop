@@ -21,6 +21,7 @@ set -u
 #
 # Dashboard keys:
 #   q = quit, j/k = scroll when the dashboard is taller than the terminal
+#   Tab = switch view, 1 = dashboard, 2 = requests
 # ==============================================================================
 
 BASE="${1:-http://127.0.0.1:6767}"
@@ -73,6 +74,7 @@ done
 TMP_DIR="$(mktemp -d)"
 ALT_SCREEN=0
 poller_pid=""
+TERMINAL_STATE=""
 
 cleanup() {
     if [[ -n "$poller_pid" ]]; then
@@ -85,6 +87,9 @@ cleanup() {
         printf '\033[?2026l\033[?7h'
         printf '\033[?25h'
         printf '\033[?1049l'
+    fi
+    if [[ -n "$TERMINAL_STATE" ]]; then
+        stty "$TERMINAL_STATE" 2>/dev/null || true
     fi
 
     rm -rf "$TMP_DIR" 2>/dev/null || true
@@ -303,12 +308,26 @@ printf '\033[?1049h'
 printf '\033[?25l'
 ALT_SCREEN=1
 
+# Keep keystrokes from being echoed between timed reads. stty is part of the
+# usual system utilities; fall back to read -s if it is not available.
+if [[ -t 0 ]] && command -v stty >/dev/null 2>&1; then
+    TERMINAL_STATE="$(stty -g)"
+    stty -echo -icanon min 1 time 0
+fi
+
 shopt -s checkwinsize
 previous_frame=()
 last_frame=""
 last_frame_rows=0
 last_frame_cols=0
 scroll_offset=0
+current_view=1
+view_frames=([1]=' llamatop — Dashboard
+ Connecting to server...
+ 1 Dashboard | 2 Requests | Tab switch | q quit' [2]=' llamatop — Requests
+ Waiting for the first request sample...
+ 1 Dashboard | 2 Requests | Tab switch | q quit')
+view_offsets=([1]=0 [2]=0)
 
 # All slow formatting finishes off-screen. Then overwrite changed rows in one
 # buffered update, without clearing the screen first. DEC mode 2026 additionally
@@ -337,7 +356,7 @@ present_frame() {
         for ((row=0; row<body_rows; row++)); do
             visible+=("${lines[row+scroll_offset]}")
         done
-        printf -v footer ' q = quit | j/k = scroll | lines %s-%s/%s' \
+        printf -v footer ' q quit | j/k = scroll | Tab/1/2 views | lines %s-%s/%s' \
             "$((scroll_offset+1))" "$((scroll_offset+body_rows))" "$total"
         visible+=("$footer")
     else
@@ -391,6 +410,9 @@ last_sample_ts=""
 # Live slot state from previous poll
 prev_slots='[]'
 remembered_requests='[]'
+request_log='{"next":0,"items":[]}'
+REQUEST_NOTICE=""
+REQUEST_UNTRACKED=0
 
 # ==============================================================================
 # History / sparkline
@@ -656,8 +678,126 @@ endpoint_error() {
 }
 
 # ==============================================================================
+# Per-request observations (bounded, in memory; no client or chat identity)
+# ==============================================================================
+
+mark_requests_unknown() {
+    request_log="$(jq -c '.items |= map(
+        if .status == "active" or .status == "unknown" then
+            .status = "unknown" | .decode_rate = null | .prefill_rate = null
+        else . end)' <<< "$request_log")"
+}
+
+update_requests() {
+    REQUEST_NOTICE=""
+    [[ "$SLOTS_OK" == "0" ]] && REQUEST_NOTICE="/slots unavailable (HTTP $SLOTS_CODE); showing last observations."
+    REQUEST_UNTRACKED="$(jq '[.requests[] | select(.task == null or .task == "-1")] | length' <<< "$SLOT_SAMPLE")"
+    request_log="$(jq -c --arg model "$MODEL" --argjson now "$NOW_TS" \
+        --argjson slots "$SLOTS" --argjson sample "$SLOT_SAMPLE" --argjson ok "$SLOTS_OK" '
+        def open: .status == "active" or .status == "unknown";
+        def max_known($a; $b): [$a, $b] | map(select(. != null)) | max;
+        def low($old; $rate):
+            if $rate != null and $rate > 0 then [$old, $rate] | map(select(. != null)) | min else $old end;
+        def high($old; $rate):
+            if $rate != null and $rate > 0 then max_known($old; $rate) else $old end;
+        .items |= map(
+            . as $old |
+            if open then
+                if .model != $model then .status = "unobserved"
+                elif $ok == 0 then .status = "unknown"
+                else ([$slots[] | select(.id == $old.slot)][0]) as $slot |
+                    if $slot == null then .status = "unobserved"
+                    elif $slot.active == null or ($slot.active and $slot.task == null)
+                    then .status = "unknown"
+                    elif $slot.active == false or $slot.task != .task then
+                        .status = "ended" |
+                        if $slot.task == .task then
+                            .context = (if $slot.context != null and $slot.context > 0 then $slot.context else .context end) |
+                            .evaluated = max_known(.evaluated; $slot.evaluated) |
+                            .cached = max_known(.cached; $slot.cached) |
+                            .decoded = max_known(.decoded; $slot.decoded)
+                        else . end
+                    else . end
+                end |
+                .decode_rate = null | .prefill_rate = null
+            else . end
+        ) |
+        reduce ($sample.requests[] | select(.task != null and .task != "-1")) as $slot (.;
+            ([.items[] | select(open and .model == $model and .slot == $slot.id and .task == $slot.task)][0]) as $prior |
+            ($prior != null and (
+                ($slot.decoded != null and $prior.decoded != null and $slot.decoded < $prior.decoded) or
+                ($slot.evaluated != null and $prior.evaluated != null and $slot.evaluated < $prior.evaluated)
+            )) as $reset |
+            (if $reset then null else $prior end) as $old |
+            if $reset then .items |= map(if .seq == $prior.seq then .status = "reset" else . end) else . end |
+            if $old == null then .next += 1 else . end |
+            (if $reset then null else $slot.decode_rate end) as $decode |
+            (if $reset then null else $slot.prefill_rate end) as $prefill |
+            (($old // {seq: .next, first_seen: $now}) + {
+                model: $model, slot: $slot.id, task: $slot.task, status: "active", last_seen: $now,
+                phase: (if $slot.decoded > 0 then "DECODE" elif $slot.evaluated > 0 then "PREFILL" else "PROCESSING" end),
+                context: $slot.context, capacity: $slot.capacity, evaluated: $slot.evaluated,
+                cached: $slot.cached, decoded: $slot.decoded,
+                decode_rate: $decode, prefill_rate: $prefill,
+                decode_min: low($old.decode_min; $decode), decode_max: high($old.decode_max; $decode),
+                prefill_min: low($old.prefill_min; $prefill), prefill_max: high($old.prefill_max; $prefill)
+            }) as $new |
+            .items = ([.items[] | select(.seq != $new.seq)] + [$new])
+        ) |
+        .items = ([.items[] | select(open)] +
+            ([.items[] | select(open | not)] | sort_by(.last_seen, .seq) | reverse | .[:20]))
+    ' <<< "$request_log")"
+}
+
+render_requests() {
+    printf ' llamatop — Requests                          %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    echo ' 1 Dashboard  [2 Requests]    Tab = switch view'
+    printf ' Monitoring: %s\n' "${MODEL:-none}"
+    echo ' Slot/task IDs identify work, not a client or chat.'
+    [[ -n "$REQUEST_NOTICE" ]] && printf ' %s\n' "$REQUEST_NOTICE"
+    if (( REQUEST_UNTRACKED > 0 )); then
+        printf ' %s active slot(s) lack task IDs; their requests cannot be tracked.\n' "$REQUEST_UNTRACKED"
+    fi
+    jq -r '
+        def open: .status == "active" or .status == "unknown";
+        def show: if . == null then "n/a" else tostring end;
+        def rate: if . == null then "n/a" else ((. * 100 | round) / 100 | tostring) end;
+        def card:
+            " Slot \(.slot) | task \(.task) | \(if .status == "active" then .phase else .status | ascii_upcase end) | \(.model)",
+            (if open then
+                "   Decode  \(.decode_rate | rate) tok/s   min \(.decode_min | rate)   max \(.decode_max | rate)",
+                "   Prefill \(.prefill_rate | rate) tok/s   min \(.prefill_min | rate)   max \(.prefill_max | rate)"
+             else
+                "   Decode min/max \(.decode_min | rate) / \(.decode_max | rate) tok/s",
+                "   Prefill min/max \(.prefill_min | rate) / \(.prefill_max | rate) tok/s"
+             end),
+            "   Context \(.context | show) / \(.capacity | show)   Evaluated \(.evaluated | show)   Cached \(.cached | show)",
+            "   Decoded \(.decoded | show) tokens   Observed \((.last_seen - .first_seen) | rate)s", "";
+        [.items[] | select(open)] as $active |
+        [.items[] | select(open | not)] as $recent |
+        "", "──────────────────────────── CURRENT REQUESTS ────────────────────────────────",
+        (if ($active | length) == 0 then " No active requests observed.", ""
+         else ($active | sort_by(.model, .slot)[] | card) end),
+        "────────────────────────── RECENT REQUESTS (LAST 20) ───────────────────────────",
+        (if ($recent | length) == 0 then " No request history yet.", ""
+         else ($recent[] | card) end)
+    ' <<< "$request_log"
+    echo ' Min/max: positive samples per request. Prefill is sampled tok/s.'
+    echo ' Observed time starts at first sighting; it is not total response latency.'
+    echo ' History is sampled; final tokens and short requests can be missed.'
+    echo ' q = quit | 1 dashboard | 2 requests | Tab switch | j/k scroll'
+}
+
+# ==============================================================================
 # Keyboard / display event loop
 # ==============================================================================
+
+switch_view() {
+    [[ "$1" == "$current_view" ]] && return
+    view_offsets[current_view]=$scroll_offset
+    current_view="$1"
+    scroll_offset=${view_offsets[current_view]}
+}
 
 read_keys() {
     local max_scroll="$1" key="" status count=0
@@ -667,6 +807,14 @@ read_keys() {
     status=$?
     while (( status == 0 )); do
         case "$key" in
+            $'\t')
+                switch_view "$((3-current_view))"
+                return 0
+                ;;
+            1|2)
+                switch_view "$key"
+                return 0
+                ;;
             q|Q)
                 exit 0
                 ;;
@@ -689,12 +837,13 @@ read_keys() {
 
 publish_frame() {
     # Only the display process writes to the terminal. NUL separates complete
-    # frames on the pipe without changing newlines inside a frame.
-    printf '%s\0' "$1"
+    # frames; their first line identifies the view, followed by the frame body.
+    printf '1\n%s\0' "$1"
+    printf '2\n%s\0' "$(render_requests)"
 }
 
 display_loop() {
-    local chunk="" pending="" status redraw old_offset max_scroll=0
+    local chunk="" pending="" status redraw old_offset old_view view max_scroll=0
     local -a frame_lines=()
     while true; do
         redraw=0
@@ -706,10 +855,14 @@ display_loop() {
             status=$?
             pending+="$chunk"
             if (( status == 0 )); then
-                last_frame="$pending"
+                view="${pending%%$'\n'*}"
+                view_frames[view]="${pending#*$'\n'}"
                 pending=""
-                mapfile -t frame_lines <<< "$last_frame"
-                redraw=1
+                if [[ "$view" == "$current_view" ]]; then
+                    last_frame="${view_frames[current_view]}"
+                    mapfile -t frame_lines <<< "$last_frame"
+                    redraw=1
+                fi
             elif (( status == 1 )); then
                 wait "$poller_pid"
                 status=$?
@@ -722,7 +875,13 @@ display_loop() {
             max_scroll=$((${#frame_lines[@]} - ${LINES:-24} + 1))
         fi
         old_offset=$scroll_offset
+        old_view=$current_view
         read_keys "$max_scroll"
+        if [[ "$old_view" != "$current_view" ]]; then
+            last_frame="${view_frames[current_view]}"
+            mapfile -t frame_lines <<< "$last_frame"
+            redraw=1
+        fi
         if (( resize_pending )); then
             resize_pending=0
             sleep 0
@@ -732,6 +891,7 @@ display_loop() {
             { [[ -t 1 ]] && (( ${LINES:-24} != last_frame_rows || ${COLUMNS:-80} != last_frame_cols )); }
         }; then
             present_frame "$last_frame"
+            view_offsets[current_view]=$scroll_offset
         fi
     done
 }
@@ -752,6 +912,8 @@ while true; do
     then
         MODELS_OK=0
         if [[ -z "$PINNED_MODEL" ]]; then
+            REQUEST_NOTICE="/models unavailable (HTTP $MODELS_CODE); showing last observations."
+            mark_requests_unknown
             FRAME="$(
             printf 'llamatop    %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
             endpoint_error "$BASE/models" "$MODELS_CODE" "$MODELS_ERROR" "$MODELS"
@@ -769,6 +931,8 @@ while true; do
 
     select_dashboard_model
     if [[ -z "$MODEL" ]]; then
+        REQUEST_NOTICE='No model loaded; showing last observations.'
+        mark_requests_unknown
         FRAME="$(
         printf 'llamatop    %s\nServer: %s\n\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$BASE"
         echo 'No model currently loaded.'
@@ -869,14 +1033,12 @@ while true; do
     # counter at zero: short prefills often finish before their first poll.
     # This is throughput over the whole polling interval, not prefill duration.
     # On startup/recovery there is no prior observation, so use a zero baseline.
-    SLOT_LIVE="$(jq -r --argjson previous "$prev_slots" --argjson ok "$SLOTS_OK" '
+    SLOT_SAMPLE="$(jq -c --argjson previous "$prev_slots" --argjson ok "$SLOTS_OK" --argjson dt "$SAMPLE_DT" '
         def sum_known:
             if any(.[]; . == null) then null else (add // 0) end;
-        def display: if . == null then "n/a" else tostring end;
         . as $slots | [.[] | select(.active == true)] as $active |
-        def delta($field):
-            if $ok == 0 or any($slots[]; .active == null) then null
-            else [$active[] | . as $now |
+        def slot_delta($now; $field):
+            $now |
                 if .task == null or .[$field] == null then null
                 else ([$previous[] | select(.id == $now.id)][0]) as $prior_slot |
                     ([$previous[] | select(.id == $now.id and .task == $now.task and .active == true)][0]) as $old |
@@ -887,9 +1049,18 @@ while true; do
                         then $now[$field] else 0 end
                     elif $old[$field] == null then 0
                     else [0, ($now[$field] - $old[$field])] | max end
-                end
-            ] | sum_known end;
-        [
+                end;
+        def delta($field):
+            if $ok == 0 or any($slots[]; .active == null) then null
+            else [$active[] | slot_delta(.; $field)] | sum_known end;
+        def rate($now; $field):
+            ([$previous[] | select(.id == $now.id)][0]) as $old |
+            if $dt <= 0 or $now.task == null or $now[$field] == null or $old == null then null
+            elif ($old.active == true and $old.task == $now.task and $old[$field] != null) or
+                 ($field == "evaluated" and ($old.active == false or
+                    ($old.task != null and $old.task != $now.task)))
+            then slot_delta($now; $field) / $dt else null end;
+        {totals: [
             (if $ok == 0 then null else $active | map(.evaluated) | sum_known end),
             (if $ok == 0 then null else $active | map(.decoded) | sum_known end),
             (if $ok == 0 then null else $active | map(.context) | sum_known end),
@@ -901,8 +1072,12 @@ while true; do
             (if length == 0 then null else map(.capacity) | sum_known end),
             length,
             (if any(.[]; .active == null) then 1 else 0 end)
-        ] | map(display) | @tsv
+        ], requests: [$active[] | . as $now | . + {
+            decode_rate: rate($now; "decoded"), prefill_rate: rate($now; "evaluated")
+        }]}
     ' <<< "$SLOTS")"
+    SLOT_LIVE="$(jq -r '.totals | map(if . == null then "n/a" else tostring end) | @tsv' <<< "$SLOT_SAMPLE")"
+    update_requests
 
     IFS=$'\t' read -r \
         SLOT_PROMPT_PROCESSED SLOT_DECODED SLOT_CONTEXT SLOT_CACHED SLOT_ACTIVE_COUNT \
@@ -977,6 +1152,7 @@ while true; do
     echo '════════════════════════════════════════════════════════════════════════════════'
     printf ' llamatop — llama.cpp                          %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     echo '════════════════════════════════════════════════════════════════════════════════'
+    echo ' [1 Dashboard]  2 Requests    Tab = switch view'
     printf ' Model                %s  [%s]\n Server               %s\n State                %s\n' "$MODEL" "$MODEL_MODE" "$BASE" "$REQUEST_STATE"
 
     echo
@@ -1095,4 +1271,5 @@ set +m
 # loop otherwise uses builtins, so trigger that refresh only on a resize.
 resize_pending=0
 trap 'resize_pending=1' WINCH
+sleep 0
 display_loop

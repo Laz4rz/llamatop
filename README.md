@@ -16,7 +16,7 @@ Prefill sampled            0.00 tok/s   ········  min 62.50  max 84.20
 Current context       30328 / 73728  41.1%  [████████████░░░░░░░░░░░░░░░░░░]
 High-water context    31137 tokens
 
-q = quit · j/k = scroll
+Tab = switch view · q = quit · j/k = scroll
 ```
 
 *Illustrative, abridged output.*
@@ -24,6 +24,7 @@ q = quit · j/k = scroll
 - **Live decode** from slot token deltas, with sparklines and min/max rates.
 - **Current context** on a fixed 0–100% bar, separate from the high-water mark.
 - **Automatic model selection**, or pin a specific model.
+- **Separate request view** with individual rates, token counts, and recent history.
 - **Stable terminal updates** with responsive scrolling, even during slow server requests.
 - **Exact raw responses** for debugging API errors and server differences.
 
@@ -75,7 +76,7 @@ SHOW_ALL_METRICS=0 ./llamatop.sh http://127.0.0.1:6767 'YOUR_API_KEY' 0.2
 HISTORY_LEN=60 ./llamatop.sh http://127.0.0.1:6767 'YOUR_API_KEY' 0.5
 ```
 
-Dashboard controls: **`q`** quits; **`j` / `k`** scroll one row at a time when the display is taller than the terminal. Hold either key to keep scrolling. Input and resizing work independently of the polling interval and server response time. Widen the terminal if a row is clipped. `Ctrl+C` also exits, including in raw-watch mode.
+Controls: **`Tab`** switches views; **`1`** opens the dashboard and **`2`** opens requests. **`q`** quits; **`j` / `k`** scroll one row at a time. Hold either key to keep scrolling. Each view remembers its scroll position. Input, view switching, and resizing work independently of the polling interval and server response time. Widen the terminal if a row is clipped. `Ctrl+C` also exits, including in raw-watch mode.
 
 With multiple loaded models, the dashboard prefers one with an active slot. When all are idle, it stays with the previously selected model if still loaded. Requests to `/slots` and `/metrics` include `autoload=false`.
 
@@ -99,6 +100,16 @@ With multiple loaded models, the dashboard prefers one with an active slot. When
 The **Counter scope** line tells you whether request counts are active or retained. After completion, llamatop keeps the last observed request per slot because the server may clear its statistics. These saved counts can miss final tokens between polls; they do not feed live rates or current context occupancy. A separate **Request context** row appears only when that count differs from current context.
 
 Rate sparklines scale to their history; the context bar always uses **0–100%**. All-zero history shows dots. `n/a` means unavailable, and `?` marks an unavailable sparkline sample. Short requests can finish entirely between polls, so not every prefill will appear in the graph.
+
+### Requests view
+
+Press **`2`** to see each observed request separately, identified by model, slot, and task ID. Each entry shows live decode, sampled prefill, positive min/max rates, context, evaluated and cached tokens, and decoded tokens. Two concurrent requests have independent counters and rates.
+
+The view follows the **same selected model** as the dashboard. It retains the last **20 recently observed requests** in memory, including observations from previously selected models. It does not poll every loaded model at once.
+
+`ENDED` means the slot became idle or was assigned a different task; it does not confirm successful completion. `UNKNOWN` means monitoring cannot currently confirm the request state. `UNOBSERVED` means the model or slot is no longer being followed. `RESET` marks a counter decrease under the same task ID; subsequent samples start a separate record.
+
+History contains sampled totals, which can miss final tokens and entire short requests. **Observed** time runs from first to last active sighting, not from the actual request start. Slot/task IDs do not identify a client or conversation.
 
 ## Troubleshooting
 
