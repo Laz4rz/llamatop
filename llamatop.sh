@@ -19,8 +19,8 @@ set -u
 # Pin model instead of auto-detect:
 #   ~/llamatop.sh http://127.0.0.1:6767 jan 2 Qwen3_8-27B-UD-Q6_K_XL
 #
-# Dashboard key:
-#   q = quit
+# Dashboard keys:
+#   q = quit, j/k = scroll when the dashboard is taller than the terminal
 # ==============================================================================
 
 BASE="${1:-http://127.0.0.1:6767}"
@@ -75,6 +75,8 @@ ALT_SCREEN=0
 
 cleanup() {
     if [[ "$ALT_SCREEN" == "1" ]]; then
+        # Release synchronized output / wrapping even if interrupted mid-frame.
+        printf '\033[?2026l\033[?7h'
         printf '\033[?25h'
         printf '\033[?1049l'
     fi
@@ -296,8 +298,76 @@ printf '\033[?1049h'
 printf '\033[?25l'
 ALT_SCREEN=1
 
-clear_screen() {
-    printf '\033[H\033[J'
+shopt -s checkwinsize
+previous_frame=()
+last_frame=""
+last_frame_rows=0
+last_frame_cols=0
+scroll_offset=0
+
+# All slow formatting finishes off-screen. Then overwrite changed rows in one
+# buffered update, without clearing the screen first. DEC mode 2026 additionally
+# groups the update on supporting terminals; other terminals ignore that mode.
+present_frame() {
+    last_frame="$1"
+    if [[ ! -t 1 ]]; then
+        # Preserve complete snapshots when output is captured rather than shown.
+        printf '\033[H\033[J%s\n' "$last_frame"
+        return
+    fi
+    local rows="${LINES:-24}" cols="${COLUMNS:-80}"
+    [[ "$rows" =~ ^[1-9][0-9]*$ ]] || rows=24
+    [[ "$cols" =~ ^[1-9][0-9]*$ ]] || cols=80
+    local -a lines=() visible=()
+    local total body_rows max_offset row count line old_line part payload="" footer resized=0
+    local width=$((cols > 1 ? cols-1 : 1))
+    mapfile -t lines <<< "$last_frame"
+    total=${#lines[@]}
+    body_rows=$rows
+    if (( total > rows )); then
+        body_rows=$((rows-1))
+        max_offset=$((total-body_rows))
+        (( scroll_offset > max_offset )) && scroll_offset=$max_offset
+        (( scroll_offset < 0 )) && scroll_offset=0
+        for ((row=0; row<body_rows; row++)); do
+            visible+=("${lines[row+scroll_offset]}")
+        done
+        printf -v footer ' q = quit | j/k = scroll | lines %s-%s/%s' \
+            "$((scroll_offset+1))" "$((scroll_offset+body_rows))" "$total"
+        visible+=("$footer")
+    else
+        scroll_offset=0
+        visible=("${lines[@]}")
+    fi
+    if (( rows != last_frame_rows || cols != last_frame_cols )); then
+        previous_frame=()
+        resized=1
+    fi
+    count=${#visible[@]}
+    (( ${#previous_frame[@]} > count )) && count=${#previous_frame[@]}
+    (( resized )) && count=$rows
+    (( count > rows )) && count=$rows
+    for ((row=0; row<count; row++)); do
+        line="${visible[row]:-}"
+        # Keep each logical line in its own physical row. Do not let endpoint
+        # text move the cursor or cause wrapping/scrolling during a refresh.
+        line="${line//$'\r'/}"
+        line="${line//$'\t'/    }"
+        line="${line//$'\033'/?}"
+        line="${line:0:width}"
+        old_line="${previous_frame[row]-}"
+        if [[ ! ${previous_frame[row]+present} || "$line" != "$old_line" ]]; then
+            printf -v part '\033[%s;1H%s\033[K' "$((row+1))" "$line"
+            payload+="$part"
+        fi
+        visible[row]="$line"
+    done
+    previous_frame=("${visible[@]}")
+    last_frame_rows=$rows
+    last_frame_cols=$cols
+    if [[ -n "$payload" ]]; then
+        printf '\033[?2026h\033[?7l%s\033[?7h\033[?2026l' "$payload"
+    fi
 }
 
 # ==============================================================================
@@ -567,6 +637,14 @@ check_keypress() {
             q|Q)
                 exit 0
                 ;;
+            j)
+                ((scroll_offset+=3))
+                [[ -n "$last_frame" ]] && present_frame "$last_frame"
+                ;;
+            k)
+                ((scroll_offset-=3))
+                [[ -n "$last_frame" ]] && present_frame "$last_frame"
+                ;;
         esac
     fi
 }
@@ -607,11 +685,13 @@ while true; do
     then
         MODELS_OK=0
         if [[ -z "$PINNED_MODEL" ]]; then
-            clear_screen
+            FRAME="$(
             printf 'llamatop    %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
             endpoint_error "$BASE/models" "$MODELS_CODE" "$MODELS_ERROR" "$MODELS"
             [[ "$MODELS_CODE" == "200" ]] && echo 'Expected a /models object containing a data array.'
             echo 'q = quit'
+            )"
+            present_frame "$FRAME"
             prev_slots='[]'
             last_sample_ts=""
             responsive_sleep "$INTERVAL"
@@ -621,7 +701,7 @@ while true; do
 
     select_dashboard_model
     if [[ -z "$MODEL" ]]; then
-        clear_screen
+        FRAME="$(
         printf 'llamatop    %s\nServer: %s\n\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$BASE"
         echo 'No model currently loaded.'
         jq -r '
@@ -629,6 +709,8 @@ while true; do
             "  \(.status | if type == "object" then .value else . end // "?")   \(.id // "?")"
         ' <<< "$MODELS"
         echo 'Waiting...  q = quit'
+        )"
+        present_frame "$FRAME"
         prev_slots='[]'
         last_sample_ts=""
         responsive_sleep "$INTERVAL"
@@ -816,7 +898,7 @@ while true; do
     update_rate_range "$GEN_LIVE" gen_min gen_max
     update_rate_range "$PROMPT_LIVE" prompt_min prompt_max
 
-    clear_screen
+    FRAME="$(
     echo '════════════════════════════════════════════════════════════════════════════════'
     printf ' llamatop — Jan / llama.cpp                    %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     echo '════════════════════════════════════════════════════════════════════════════════'
@@ -915,5 +997,7 @@ while true; do
     [[ "$SLOTS_OK" == "0" ]] && endpoint_error "$SLOTS_URL" "$SLOTS_CODE" "$SLOTS_ERROR" "$SLOTS_BODY"
     echo
     echo ' q = quit   |   --raw = exact endpoint bodies   |   n/a = unavailable'
+    )"
+    present_frame "$FRAME"
     responsive_sleep "$INTERVAL"
 done
