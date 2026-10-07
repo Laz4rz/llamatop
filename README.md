@@ -95,7 +95,7 @@ With multiple loaded models, the dashboard prefers one with an active slot. When
 
 **Context already includes generated tokens.** `n_decoded` is never added to `n_prompt_tokens`.
 
-The **Counter scope** line tells you whether request counts are active or retained. After completion, llamatop keeps the last observed request per slot because the server may clear its statistics. These saved counts can miss final tokens between polls; they do not feed live rates or current context occupancy.
+The **Counter scope** line tells you whether request counts are active or retained. After completion, llamatop keeps the last observed request per slot because the server may clear its statistics. These saved counts can miss final tokens between polls; they do not feed live rates or current context occupancy. A separate **Request context** row appears only when that count differs from current context.
 
 Rate sparklines scale to their history; the context bar always uses **0–100%**. All-zero history shows dots. `n/a` means unavailable, and `?` marks an unavailable sparkline sample. Short requests can finish entirely between polls, so not every prefill will appear in the graph.
 

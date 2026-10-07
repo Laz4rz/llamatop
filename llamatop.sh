@@ -915,37 +915,42 @@ while true; do
     printf '  min %s  max %s' "$prompt_min" "$prompt_max"
     printf '\n                      Min/max: nonzero samples since model selection (tok/s).'
     printf '\n\n Counter scope        %s\n' "$COUNTER_SCOPE"
-    printf ' Context tokens       %9s  (sequence count, including output tokens)\n' "$DISPLAY_CONTEXT"
-    printf ' Prefill tokens       %9s  (input tokens processed after cache reuse)\n' "$DISPLAY_PREFILL"
-    printf ' Prompt cached/reused %9s  (explicit slot field, when available)\n' "$DISPLAY_CACHED"
+    if [[ "$DISPLAY_CONTEXT" != "n/a" && "$DISPLAY_CONTEXT" != "$CTX_CURRENT" ]]; then
+        printf ' Request context      %9s tokens\n' "$DISPLAY_CONTEXT"
+    fi
+    printf ' Prefill tokens       %9s\n' "$DISPLAY_PREFILL"
+    printf ' Prompt cached/reused %9s\n' "$DISPLAY_CACHED"
     printf ' Decoded tokens       %9s\n' "$DISPLAY_DECODED"
     printf ' Sample delta         prefill=%s  decode=%s  over %.2fs\n' "$SLOT_PROMPT_DELTA" "$SLOT_DECODED_DELTA" "$SAMPLE_DT"
-    echo '                      Prefill sampled = tokens observed per poll interval.'
-    echo '                      Decode needs two samples of the same request.'
     [[ "$SLOT_ACTIVE_COUNT" == "0" ]] && echo '                      Saved counts may omit final tokens between polls.'
 
     echo
     echo '──────────────────────────── /metrics AGGREGATE ────────────────────────────────'
-    printf ' Decode average       %9s tok/s  (aggregate gauge, not live)\n' "$GEN_AVG"
-    printf ' Prefill average      %9s tok/s  (aggregate gauge, not live)\n' "$PROMPT_AVG"
+    printf ' Decode average       %9s tok/s\n' "$GEN_AVG"
+    printf ' Prefill average      %9s tok/s\n' "$PROMPT_AVG"
+    echo '                      Aggregate gauges, not live throughput.'
     printf ' Requests             processing=%s  queued=%s\n' "$PROCESSING" "$DEFERRED"
     printf ' Reported totals      prompt=%s  generated=%s\n' "$PROMPT_METRIC_TOTAL" "$GENERATED_METRIC_TOTAL"
 
     echo
     echo '───────────────────────────────── CONTEXT ──────────────────────────────────────'
-    printf ' Current context      %s / %s  %s%%  ' "$CTX_CURRENT" "$CTX_CAPACITY" "$CTX_PCT"
+    CTX_PCT_LABEL="$CTX_PCT"
+    [[ "$CTX_PCT" != "n/a" ]] && CTX_PCT_LABEL+='%'
+    printf ' Current context      %s / %s  %s  ' "$CTX_CURRENT" "$CTX_CAPACITY" "$CTX_PCT_LABEL"
     context_bar "$CTX_CURRENT" "$CTX_CAPACITY"
-    printf '\n Context capacity     %s tokens\n Current context %%    %s%%\n' "$CTX_CAPACITY" "$CTX_PCT"
-    printf ' Context scope        all %s reported slot(s), including retained idle sequences\n' "$SLOT_COUNT"
-    printf ' High-water context   %s tokens  (/metrics n_tokens_max)\n' "$CTX_HI"
-    echo '                      Largest sequence observed; separate from current context.'
+    printf '\n'
+    if (( SLOT_COUNT > 1 )); then
+        printf ' Context scope        all %s slots, including retained idle sequences\n' "$SLOT_COUNT"
+    fi
+    printf ' High-water context   %s tokens  (largest sequence observed)\n' "$CTX_HI"
 
     echo
     echo '────────────────────────────────── MTP ─────────────────────────────────────────'
-    printf ' Acceptance           %s%%\n Accepted             %s\n Draft tokens         %s\n Verify steps         %s\n' \
-        "$MTP_TOTAL" "$ACCEPTED" "$DRAFT" "$DRAFT_STEPS"
-    echo '                      Aggregate statistics; may update only on request completion.'
-    echo '                      Updates during generation are not guaranteed.'
+    MTP_PCT_LABEL="$MTP_TOTAL"
+    [[ "$MTP_TOTAL" != "n/a" ]] && MTP_PCT_LABEL+='%'
+    printf ' Draft acceptance     %s  (%s / %s tokens)\n Verify steps         %s\n' \
+        "$MTP_PCT_LABEL" "$ACCEPTED" "$DRAFT" "$DRAFT_STEPS"
+    echo '                      Aggregate; may update only on request completion.'
 
     echo
     echo '────────────────────────────────── SLOTS ───────────────────────────────────────'
@@ -967,8 +972,6 @@ while true; do
     done
     echo ' PREFILL = input tokens processed after reuse; CACHED = explicit reused-token count.'
 
-    echo
-    echo '──────────────────────────── ACTIVE SLOT DETAILS ───────────────────────────────'
     ACTIVE_DETAILS="$(jq -r '
         def show: if . == null then "n/a" else tostring end;
         def r3: if type == "number" then ((. * 1000 | round) / 1000) else . end;
@@ -977,9 +980,9 @@ while true; do
         "spec_nmax=\(.spec_nmax | show)  spec_nmin=\(.spec_nmin | show)  spec_pmin=\(.spec_pmin | r3 | show)"
     ' <<< "$SLOTS")"
     if [[ -n "$ACTIVE_DETAILS" ]]; then
+        echo
+        echo '──────────────────────────── ACTIVE SLOT DETAILS ───────────────────────────────'
         printf '%s\n' "$ACTIVE_DETAILS"
-    else
-        echo '(no active slot details available)'
     fi
 
     if [[ "$SHOW_ALL_METRICS" == "1" ]]; then
