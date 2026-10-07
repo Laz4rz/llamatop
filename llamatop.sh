@@ -586,9 +586,11 @@ while true; do
         done <<< "$METRICS"
     fi
 
-    # Match each slot and request independently: a new request, reset, reordered
-    # slot list, or missing counter must not cause a spike. First sample is a
-    # baseline (zero delta). Missing task IDs cannot safely identify a request.
+    # Match each slot and request independently. Decode always uses two samples
+    # of the same request. For prefill, an observed request change starts its
+    # counter at zero: short prefills often finish before their first poll.
+    # This is throughput over the whole polling interval, not prefill duration.
+    # On startup/recovery there is no prior observation, so use a zero baseline.
     SLOT_LIVE="$(jq -r --argjson previous "$prev_slots" --argjson ok "$SLOTS_OK" '
         def sum_known:
             if any(.[]; . == null) then null else (add // 0) end;
@@ -598,8 +600,14 @@ while true; do
             if $ok == 0 or any($slots[]; .active == null) then null
             else [$active[] | . as $now |
                 if .task == null or .[$field] == null then null
-                else ([$previous[] | select(.id == $now.id and .task == $now.task and .active == true)][0]) as $old |
-                    if $old == null or $old[$field] == null then 0
+                else ([$previous[] | select(.id == $now.id)][0]) as $prior_slot |
+                    ([$previous[] | select(.id == $now.id and .task == $now.task and .active == true)][0]) as $old |
+                    if $old == null then
+                        if $field == "evaluated" and $prior_slot != null and
+                           ($prior_slot.active == false or
+                            ($prior_slot.task != null and $prior_slot.task != $now.task))
+                        then $now[$field] else 0 end
+                    elif $old[$field] == null then 0
                     else [0, ($now[$field] - $old[$field])] | max end
                 end
             ] | sum_known end;
@@ -636,7 +644,7 @@ while true; do
         REQUEST_STATE="UNKNOWN"
     elif (( SLOT_ACTIVE_COUNT > 0 )); then
         if awk -v d="$SLOT_DECODED_DELTA" 'BEGIN { exit !(d != "n/a" && d+0 > 0) }'; then
-            REQUEST_STATE="GENERATING"
+            REQUEST_STATE="DECODE"
         elif awk -v d="$SLOT_PROMPT_DELTA" 'BEGIN { exit !(d != "n/a" && d+0 > 0) }'; then
             REQUEST_STATE="PREFILL"
         else
@@ -678,21 +686,22 @@ while true; do
 
     echo
     echo '────────────────────────────── LIVE REQUEST ────────────────────────────────────'
-    printf ' Generation live      %9s tok/s   ' "$GEN_LIVE"
+    printf ' Decode live          %9s tok/s   ' "$GEN_LIVE"
     spark "${gen_hist[@]}"
-    printf '\n Prompt eval live     %9s tok/s   ' "$PROMPT_LIVE"
+    printf '\n Prefill sampled      %9s tok/s   ' "$PROMPT_LIVE"
     spark "${prompt_hist[@]}"
     printf '\n\n Context tokens       %9s  (active slots; includes generated tokens)\n' "$SLOT_CONTEXT"
-    printf ' Prompt evaluated     %9s  (after cache reuse)\n' "$SLOT_PROMPT_PROCESSED"
+    printf ' Prefill tokens       %9s  (input tokens processed after cache reuse)\n' "$SLOT_PROMPT_PROCESSED"
     printf ' Prompt cached/reused %9s  (explicit slot field, when available)\n' "$SLOT_CACHED"
-    printf ' Output generated     %9s tokens in active requests\n' "$SLOT_DECODED"
-    printf ' Sample delta         evaluated=%s  output=%s  over %.2fs\n' "$SLOT_PROMPT_DELTA" "$SLOT_DECODED_DELTA" "$SAMPLE_DT"
-    echo '                      Rates use /slots deltas; first sample is a baseline.'
+    printf ' Decoded tokens       %9s tokens in active requests\n' "$SLOT_DECODED"
+    printf ' Sample delta         prefill=%s  decode=%s  over %.2fs\n' "$SLOT_PROMPT_DELTA" "$SLOT_DECODED_DELTA" "$SAMPLE_DT"
+    echo '                      Prefill sampled = tokens observed per poll interval.'
+    echo '                      Decode needs two samples of the same request.'
 
     echo
     echo '──────────────────────────── /metrics AGGREGATE ────────────────────────────────'
-    printf ' Generation average   %9s tok/s  (aggregate gauge, not live)\n' "$GEN_AVG"
-    printf ' Prompt average       %9s tok/s  (aggregate gauge, not live)\n' "$PROMPT_AVG"
+    printf ' Decode average       %9s tok/s  (aggregate gauge, not live)\n' "$GEN_AVG"
+    printf ' Prefill average      %9s tok/s  (aggregate gauge, not live)\n' "$PROMPT_AVG"
     printf ' Requests             processing=%s  queued=%s\n' "$PROCESSING" "$DEFERRED"
     printf ' Reported totals      prompt=%s  generated=%s\n' "$PROMPT_METRIC_TOTAL" "$GENERATED_METRIC_TOTAL"
 
@@ -715,7 +724,7 @@ while true; do
     echo
     echo '────────────────────────────────── SLOTS ───────────────────────────────────────'
     printf '%-4s %-8s %-7s %-8s %-8s %-8s %-8s %-8s %-7s %-6s %-6s %-6s\n' \
-        'ID' 'STATE' 'TASK' 'CAPACITY' 'CONTEXT' 'EVAL' 'CACHED' 'DECODED' 'REMAIN' 'TEMP' 'TOP_P' 'SPEC'
+        'ID' 'STATE' 'TASK' 'CAPACITY' 'CONTEXT' 'PREFILL' 'CACHED' 'DECODED' 'REMAIN' 'TEMP' 'TOP_P' 'SPEC'
     jq -r '
         def show: if . == null then "n/a" else tostring end;
         def r3: if type == "number" then ((. * 1000 | round) / 1000) else . end;
@@ -730,7 +739,7 @@ while true; do
         printf '%-4s %-8s %-7s %-8s %-8s %-8s %-8s %-8s %-7s %-6s %-6s %-6s\n' \
             "$id" "$state" "$task" "$capacity" "$context" "$evaluated" "$cached" "$decoded" "$remain" "$temp" "$topp" "$spec"
     done
-    echo ' EVAL = prompt tokens evaluated after reuse; CACHED = explicit reused-token count.'
+    echo ' PREFILL = input tokens processed after reuse; CACHED = explicit reused-token count.'
 
     echo
     echo '──────────────────────────── ACTIVE SLOT DETAILS ───────────────────────────────'
