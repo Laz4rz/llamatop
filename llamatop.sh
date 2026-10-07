@@ -148,14 +148,20 @@ spark() {
             if (v[i] > max) max = v[i]
         }
 
+        # Entire history is zero
+        if (min == 0 && max == 0) {
+            for (i = 1; i < ARGC; i++)
+                printf "·"
+            exit
+        }
+
         range = max - min
 
         for (i = 1; i < ARGC; i++) {
-            if (range == 0) {
+            if (range == 0)
                 idx = 3
-            } else {
-                idx = int(((v[i] - min) / range) * 7)
-            }
+            else
+                idx = int(((ARGV[i] - min) / range) * 7)
 
             if (idx < 0) idx = 0
             if (idx > 7) idx = 7
