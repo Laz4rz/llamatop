@@ -1,34 +1,27 @@
 #!/usr/bin/env bash
 set -u
 
-# ============================================================================
-# llamatop.sh
+# ==============================================================================
+# llamatop.sh — Jan / llama.cpp router monitor
 #
-# Jan / llama.cpp router monitor
-#
-# DASHBOARD:
+# Normal:
 #   ~/llamatop.sh http://127.0.0.1:6767 jan 2
 #
-# RAW ENDPOINT DUMP, ONCE:
+# Compact:
+#   SHOW_ALL_METRICS=0 ~/llamatop.sh http://127.0.0.1:6767 jan 2
+#
+# Exact raw endpoint dump:
 #   ~/llamatop.sh http://127.0.0.1:6767 jan 2 --raw
 #
-# RAW ENDPOINT DUMP, REPEATED:
+# Repeated raw endpoint dump:
 #   ~/llamatop.sh http://127.0.0.1:6767 jan 2 --raw-watch
 #
-# PIN A MODEL:
+# Pin model instead of auto-detect:
 #   ~/llamatop.sh http://127.0.0.1:6767 jan 2 Qwen3_8-27B-UD-Q6_K_XL
 #
-# PIN + RAW:
-#   ~/llamatop.sh http://127.0.0.1:6767 jan 2 \
-#       Qwen3_8-27B-UD-Q6_K_XL --raw
-#
-# Optional:
-#   SHOW_ALL_METRICS=0 ~/llamatop.sh ...
-#   HISTORY_LEN=30 ~/llamatop.sh ...
-#
-# Keys in dashboard:
+# Dashboard key:
 #   q = quit
-# ============================================================================
+# ==============================================================================
 
 BASE="${1:-http://127.0.0.1:6767}"
 API_KEY="${2:-}"
@@ -58,9 +51,9 @@ done
 HISTORY_LEN="${HISTORY_LEN:-30}"
 SHOW_ALL_METRICS="${SHOW_ALL_METRICS:-1}"
 
-# ============================================================================
+# ==============================================================================
 # Dependencies
-# ============================================================================
+# ==============================================================================
 
 for cmd in curl jq awk date; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -73,9 +66,9 @@ for cmd in curl jq awk date; do
     fi
 done
 
-# ============================================================================
-# Temporary files / cleanup
-# ============================================================================
+# ==============================================================================
+# Cleanup / terminal
+# ==============================================================================
 
 TMP_DIR="$(mktemp -d)"
 ALT_SCREEN=0
@@ -91,9 +84,9 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-# ============================================================================
+# ==============================================================================
 # HTTP
-# ============================================================================
+# ==============================================================================
 
 curl_args=(
     -sS
@@ -136,9 +129,9 @@ http_get() {
     [[ -z "$HTTP_CODE" ]] && HTTP_CODE="000"
 }
 
-# ============================================================================
+# ==============================================================================
 # Common helpers
-# ============================================================================
+# ==============================================================================
 
 urlencode() {
     jq -nr --arg x "$1" '$x | @uri'
@@ -158,16 +151,13 @@ detect_model() {
             | select(.status.value == "loaded")
             | .id
         ]
-        | if length > 0
-          then .[0]
-          else empty
-          end
+        | if length > 0 then .[0] else empty end
     ' <<< "$models"
 }
 
-# ============================================================================
-# RAW MODE
-# ============================================================================
+# ==============================================================================
+# Raw modes
+# ==============================================================================
 
 raw_snapshot() {
     local model=""
@@ -178,12 +168,8 @@ raw_snapshot() {
     echo "==============================================================================="
     echo
 
-    # ------------------------------------------------------------------------
     # /models
-    # ------------------------------------------------------------------------
-
     echo ">>> GET $BASE/models"
-
     http_get "$BASE/models"
 
     echo "HTTP $HTTP_CODE"
@@ -198,7 +184,6 @@ raw_snapshot() {
     echo
 
     if [[ "$HTTP_CODE" != "200" ]]; then
-        echo "Cannot continue without /models."
         return
     fi
 
@@ -211,19 +196,14 @@ raw_snapshot() {
 
     model_q="$(urlencode "$model")"
 
-    echo "Detected model:"
-    echo "  $model"
+    echo "Detected model: $model"
     echo
 
-    # ------------------------------------------------------------------------
     # /metrics
-    # ------------------------------------------------------------------------
-
     local metrics_url
     metrics_url="$BASE/metrics?model=$model_q&autoload=false"
 
     echo ">>> GET $metrics_url"
-
     http_get "$metrics_url"
 
     echo "HTTP $HTTP_CODE"
@@ -237,15 +217,11 @@ raw_snapshot() {
     printf '%s\n' "$HTTP_BODY"
     echo
 
-    # ------------------------------------------------------------------------
     # /slots
-    # ------------------------------------------------------------------------
-
     local slots_url
     slots_url="$BASE/slots?model=$model_q&autoload=false"
 
     echo ">>> GET $slots_url"
-
     http_get "$slots_url"
 
     echo "HTTP $HTTP_CODE"
@@ -275,9 +251,9 @@ if [[ "$MODE" == "raw-watch" ]]; then
     done
 fi
 
-# ============================================================================
-# DASHBOARD terminal setup
-# ============================================================================
+# ==============================================================================
+# Dashboard terminal
+# ==============================================================================
 
 printf '\033[?1049h'
 printf '\033[?25l'
@@ -287,38 +263,40 @@ clear_screen() {
     printf '\033[H\033[J'
 }
 
-# ============================================================================
+# ==============================================================================
 # Dashboard state
-# ============================================================================
+# ==============================================================================
 
 declare -A prev=()
 declare -A curr=()
 
-gen_live_hist=()
-prompt_live_hist=()
+gen_hist=()
+prompt_hist=()
 ctx_hist=()
-mtp_hist=()
 
 last_model=""
 last_sample_ts=""
 
-# ============================================================================
-# Fixed-width history
-# ============================================================================
+# Live slot state from previous poll
+prev_slot_task=""
+prev_slot_decoded=0
+prev_slot_prompt=0
+
+# ==============================================================================
+# History / sparkline
+# ==============================================================================
 
 reset_histories() {
-    gen_live_hist=()
-    prompt_live_hist=()
+    gen_hist=()
+    prompt_hist=()
     ctx_hist=()
-    mtp_hist=()
 
     local i
 
     for ((i=0; i<HISTORY_LEN; i++)); do
-        gen_live_hist+=(0)
-        prompt_live_hist+=(0)
+        gen_hist+=(0)
+        prompt_hist+=(0)
         ctx_hist+=(0)
-        mtp_hist+=(0)
     done
 }
 
@@ -343,7 +321,9 @@ spark() {
         return
     fi
 
-    awk '
+    local values="$*"
+
+    awk -v vals="$values" '
     BEGIN {
         blocks[0]="▁"
         blocks[1]="▂"
@@ -354,19 +334,20 @@ spark() {
         blocks[6]="▇"
         blocks[7]="█"
 
-        min = ARGV[1] + 0
+        n = split(vals, a, " ")
+
+        min = a[1] + 0
         max = min
 
-        for (i = 1; i < ARGC; i++) {
-            vals[i] = ARGV[i] + 0
+        for (i = 1; i <= n; i++) {
+            x = a[i] + 0
 
-            if (vals[i] < min) min = vals[i]
-            if (vals[i] > max) max = vals[i]
+            if (x < min) min = x
+            if (x > max) max = x
         }
 
-        # Entire history is zero
         if (min == 0 && max == 0) {
-            for (i = 1; i < ARGC; i++)
+            for (i = 1; i <= n; i++)
                 printf "·"
 
             exit
@@ -374,8 +355,8 @@ spark() {
 
         range = max - min
 
-        for (i = 1; i < ARGC; i++) {
-            x = vals[i]
+        for (i = 1; i <= n; i++) {
+            x = a[i] + 0
 
             if (range == 0)
                 idx = 3
@@ -387,7 +368,7 @@ spark() {
 
             printf "%s", blocks[idx]
         }
-    }' "$@"
+    }'
 }
 
 metric() {
@@ -395,32 +376,9 @@ metric() {
     printf '%s' "${curr[$name]:-0}"
 }
 
-delta_metric() {
-    local name="$1"
-    local current="${curr[$name]:-0}"
-    local old="${prev[$name]:-}"
-
-    if [[ -z "$old" ]]; then
-        printf '0'
-        return
-    fi
-
-    awk -v n="$current" -v o="$old" '
-        BEGIN {
-            d = n-o
-
-            # Counter reset/model reload.
-            if (d < 0)
-                d = 0
-
-            printf "%.10g", d
-        }
-    '
-}
-
-# ============================================================================
+# ==============================================================================
 # Keyboard
-# ============================================================================
+# ==============================================================================
 
 check_keypress() {
     local key=""
@@ -447,24 +405,22 @@ responsive_sleep() {
 
         elapsed="$(
             awk -v e="$elapsed" -v s="$step" '
-                BEGIN {
-                    printf "%.2f", e+s
-                }
+                BEGIN { printf "%.2f", e+s }
             '
         )"
     done
 }
 
-# ============================================================================
+# ==============================================================================
 # Main loop
-# ============================================================================
+# ==============================================================================
 
 while true; do
     check_keypress
 
-    # ------------------------------------------------------------------------
-    # /models
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # Models
+    # --------------------------------------------------------------------------
 
     http_get "$BASE/models"
 
@@ -479,29 +435,18 @@ while true; do
         echo "llamatop    $(date '+%Y-%m-%d %H:%M:%S')"
         echo
         echo "GET $BASE/models"
-        echo
         echo "HTTP $MODELS_CODE"
         echo
 
-        if [[ -n "$HTTP_ERROR" ]]; then
-            echo "$HTTP_ERROR"
-            echo
-        fi
+        [[ -n "$HTTP_ERROR" ]] && echo "$HTTP_ERROR"
+        [[ -n "$MODELS" ]] && echo "$MODELS"
 
-        if [[ -n "$MODELS" ]]; then
-            echo "$MODELS"
-            echo
-        fi
-
+        echo
         echo "q = quit"
 
         responsive_sleep "$INTERVAL"
         continue
     fi
-
-    # ------------------------------------------------------------------------
-    # Select model
-    # ------------------------------------------------------------------------
 
     MODEL="$(detect_model "$MODELS")"
 
@@ -512,8 +457,6 @@ while true; do
         echo "Server: $BASE"
         echo
         echo "No model currently loaded."
-        echo
-        echo "Router models:"
         echo
 
         jq -r '
@@ -535,9 +478,9 @@ while true; do
         MODEL_MODE="pinned"
     fi
 
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
     # Model changed
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
 
     if [[ "$MODEL" != "$last_model" ]]; then
         prev=()
@@ -546,6 +489,11 @@ while true; do
         reset_histories
 
         last_sample_ts=""
+
+        prev_slot_task=""
+        prev_slot_decoded=0
+        prev_slot_prompt=0
+
         last_model="$MODEL"
     fi
 
@@ -554,9 +502,9 @@ while true; do
     METRICS_URL="$BASE/metrics?model=$MODEL_Q&autoload=false"
     SLOTS_URL="$BASE/slots?model=$MODEL_Q&autoload=false"
 
-    # ------------------------------------------------------------------------
-    # /metrics
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # Metrics
+    # --------------------------------------------------------------------------
 
     http_get "$METRICS_URL"
 
@@ -570,7 +518,6 @@ while true; do
         echo "llamatop    $(date '+%Y-%m-%d %H:%M:%S')"
         echo
         echo "GET $METRICS_URL"
-        echo
         echo "HTTP $METRICS_CODE"
         echo
 
@@ -578,32 +525,16 @@ while true; do
         [[ -n "$METRICS" ]] && echo "$METRICS"
 
         echo
-
-        case "$METRICS_CODE" in
-            401)
-                echo "Authentication failed. Check the API key."
-                ;;
-            501|404)
-                echo "The /metrics endpoint may be disabled."
-                echo
-                echo 'Start Jan with:'
-                echo '  $env:LLAMA_ARG_ENDPOINT_METRICS="true"'
-                ;;
-            *)
-                echo "Use --raw to inspect all endpoint responses."
-                ;;
-        esac
-
-        echo
+        echo "Use --raw for exact endpoint debugging."
         echo "q = quit"
 
         responsive_sleep "$INTERVAL"
         continue
     fi
 
-    # ------------------------------------------------------------------------
-    # /slots
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # Slots
+    # --------------------------------------------------------------------------
 
     http_get "$SLOTS_URL"
 
@@ -616,9 +547,9 @@ while true; do
         SLOTS='[]'
     fi
 
-    # ------------------------------------------------------------------------
-    # Parse Prometheus values
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # Parse Prometheus metrics
+    # --------------------------------------------------------------------------
 
     curr=()
 
@@ -636,23 +567,19 @@ while true; do
         fi
     done <<< "$METRICS"
 
-    # ------------------------------------------------------------------------
-    # Timing interval
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # Actual elapsed interval
+    # --------------------------------------------------------------------------
 
     NOW_TS="$(date +%s.%N)"
-
     SAMPLE_DT="$INTERVAL"
 
     if [[ -n "$last_sample_ts" ]]; then
         SAMPLE_DT="$(
             awk -v n="$NOW_TS" -v o="$last_sample_ts" '
                 BEGIN {
-                    d = n-o
-
-                    if (d <= 0)
-                        d = 1
-
+                    d=n-o
+                    if (d <= 0) d=1
                     printf "%.6f", d
                 }
             '
@@ -661,30 +588,116 @@ while true; do
 
     last_sample_ts="$NOW_TS"
 
-    # ------------------------------------------------------------------------
-    # Official average gauges
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # Pull LIVE values from /slots
+    #
+    # Jan's build currently exposes next_token as an array.
+    # Upstream may expose it as an object. Support both.
+    # --------------------------------------------------------------------------
 
-    GEN_AVG="$(metric 'llamacpp:predicted_tokens_seconds')"
-    PROMPT_AVG="$(metric 'llamacpp:prompt_tokens_seconds')"
+    SLOT_LIVE="$(
+        jq -r '
+            def nt:
+                if (.next_token | type) == "array" then
+                    (.next_token[0] // {})
+                elif (.next_token | type) == "object" then
+                    .next_token
+                else
+                    {}
+                end;
 
-    # ------------------------------------------------------------------------
-    # Counters
-    # ------------------------------------------------------------------------
+            [
+                .[]
+                | select(.is_processing == true)
+            ] as $active
 
-    PROMPT_TOTAL="$(metric 'llamacpp:prompt_tokens_total')"
-    GENERATED_TOTAL="$(metric 'llamacpp:tokens_predicted_total')"
+            |
 
-    PROMPT_DELTA="$(delta_metric 'llamacpp:prompt_tokens_total')"
-    GENERATED_DELTA="$(delta_metric 'llamacpp:tokens_predicted_total')"
+            [
+                (
+                    $active
+                    | map(.id_task // "-")
+                    | map(tostring)
+                    | join(",")
+                ),
 
-    # ------------------------------------------------------------------------
-    # Actual sample-to-sample "live" rates
-    # ------------------------------------------------------------------------
+                (
+                    $active
+                    | map(.n_prompt_tokens_processed // 0)
+                    | add // 0
+                ),
+
+                (
+                    $active
+                    | map(nt | .n_decoded // 0)
+                    | add // 0
+                ),
+
+                (
+                    $active
+                    | map(.n_prompt_tokens // 0)
+                    | add // 0
+                ),
+
+                ($active | length)
+
+            ]
+            | @tsv
+        ' <<< "$SLOTS"
+    )"
+
+    IFS=$'\t' read -r \
+        SLOT_TASK \
+        SLOT_PROMPT_PROCESSED \
+        SLOT_DECODED \
+        SLOT_PROMPT_TOTAL \
+        SLOT_ACTIVE_COUNT \
+        <<< "$SLOT_LIVE"
+
+    SLOT_TASK="${SLOT_TASK:-}"
+    SLOT_PROMPT_PROCESSED="${SLOT_PROMPT_PROCESSED:-0}"
+    SLOT_DECODED="${SLOT_DECODED:-0}"
+    SLOT_PROMPT_TOTAL="${SLOT_PROMPT_TOTAL:-0}"
+    SLOT_ACTIVE_COUNT="${SLOT_ACTIVE_COUNT:-0}"
+
+    # --------------------------------------------------------------------------
+    # Live deltas
+    #
+    # When task ID changes, don't compare new counters with old task counters.
+    # First poll of a new request therefore shows 0 live speed; next poll is real.
+    # --------------------------------------------------------------------------
+
+    SLOT_PROMPT_DELTA=0
+    SLOT_DECODED_DELTA=0
+
+    if [[ -n "$SLOT_TASK" && "$SLOT_TASK" == "$prev_slot_task" ]]; then
+
+        SLOT_PROMPT_DELTA="$(
+            awk \
+                -v n="$SLOT_PROMPT_PROCESSED" \
+                -v o="$prev_slot_prompt" '
+            BEGIN {
+                d=n-o
+                if (d < 0) d=0
+                printf "%.0f", d
+            }'
+        )"
+
+        SLOT_DECODED_DELTA="$(
+            awk \
+                -v n="$SLOT_DECODED" \
+                -v o="$prev_slot_decoded" '
+            BEGIN {
+                d=n-o
+                if (d < 0) d=0
+                printf "%.0f", d
+            }'
+        )"
+    fi
 
     PROMPT_LIVE="$(
         awk \
-            -v d="$PROMPT_DELTA" \
+            -v d="$SLOT_PROMPT_DELTA" \
             -v t="$SAMPLE_DT" '
         BEGIN {
             if (t > 0)
@@ -696,7 +709,7 @@ while true; do
 
     GEN_LIVE="$(
         awk \
-            -v d="$GENERATED_DELTA" \
+            -v d="$SLOT_DECODED_DELTA" \
             -v t="$SAMPLE_DT" '
         BEGIN {
             if (t > 0)
@@ -706,21 +719,27 @@ while true; do
         }'
     )"
 
-    PROCESSING="$(metric 'llamacpp:requests_processing')"
-    DEFERRED="$(metric 'llamacpp:requests_deferred')"
+    # Save slot values for next poll
+    prev_slot_task="$SLOT_TASK"
+    prev_slot_prompt="$SLOT_PROMPT_PROCESSED"
+    prev_slot_decoded="$SLOT_DECODED"
 
-    # ------------------------------------------------------------------------
-    # State
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # Request state
+    # --------------------------------------------------------------------------
 
     REQUEST_STATE="IDLE"
 
-    if awk -v p="$PROCESSING" 'BEGIN {exit !(p > 0)}'; then
+    if (( SLOT_ACTIVE_COUNT > 0 )); then
 
-        if awk -v g="$GENERATED_DELTA" 'BEGIN {exit !(g > 0)}'; then
+        if awk -v d="$SLOT_DECODED_DELTA" \
+            'BEGIN {exit !(d > 0)}'
+        then
             REQUEST_STATE="GENERATING"
 
-        elif awk -v p="$PROMPT_DELTA" 'BEGIN {exit !(p > 0)}'; then
+        elif awk -v d="$SLOT_PROMPT_DELTA" \
+            'BEGIN {exit !(d > 0)}'
+        then
             REQUEST_STATE="PREFILL"
 
         else
@@ -728,9 +747,23 @@ while true; do
         fi
     fi
 
-    # ------------------------------------------------------------------------
-    # Context high-water mark
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # llama.cpp aggregate /metrics gauges
+    # These are NOT live rates.
+    # --------------------------------------------------------------------------
+
+    GEN_AVG="$(metric 'llamacpp:predicted_tokens_seconds')"
+    PROMPT_AVG="$(metric 'llamacpp:prompt_tokens_seconds')"
+
+    PROCESSING="$(metric 'llamacpp:requests_processing')"
+    DEFERRED="$(metric 'llamacpp:requests_deferred')"
+
+    PROMPT_METRIC_TOTAL="$(metric 'llamacpp:prompt_tokens_total')"
+    GENERATED_METRIC_TOTAL="$(metric 'llamacpp:tokens_predicted_total')"
+
+    # --------------------------------------------------------------------------
+    # Context
+    # --------------------------------------------------------------------------
 
     CTX_HI="$(metric 'llamacpp:n_tokens_max')"
 
@@ -753,21 +786,15 @@ while true; do
         }'
     )"
 
-    # ------------------------------------------------------------------------
-    # MTP
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # MTP aggregate counters
+    #
+    # These may not update until a request completes, so do NOT label as live.
+    # --------------------------------------------------------------------------
 
     DRAFT="$(metric 'llamacpp:spec_decode_num_draft_tokens_total')"
     ACCEPTED="$(metric 'llamacpp:spec_decode_num_accepted_tokens_total')"
     DRAFT_STEPS="$(metric 'llamacpp:spec_decode_num_drafts_total')"
-
-    DRAFT_DELTA="$(
-        delta_metric 'llamacpp:spec_decode_num_draft_tokens_total'
-    )"
-
-    ACCEPTED_DELTA="$(
-        delta_metric 'llamacpp:spec_decode_num_accepted_tokens_total'
-    )"
 
     MTP_TOTAL="$(
         awk \
@@ -781,36 +808,17 @@ while true; do
         }'
     )"
 
-    MTP_RECENT="-"
-
-    if awk -v d="$DRAFT_DELTA" 'BEGIN {exit !(d > 0)}'; then
-        MTP_RECENT="$(
-            awk \
-                -v a="$ACCEPTED_DELTA" \
-                -v d="$DRAFT_DELTA" '
-            BEGIN {
-                printf "%.1f", 100*a/d
-            }'
-        )"
-    fi
-
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
     # Histories
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
 
-    push_hist gen_live_hist "$GEN_LIVE"
-    push_hist prompt_live_hist "$PROMPT_LIVE"
+    push_hist gen_hist "$GEN_LIVE"
+    push_hist prompt_hist "$PROMPT_LIVE"
     push_hist ctx_hist "$CTX_PCT"
 
-    if [[ "$MTP_RECENT" != "-" ]]; then
-        push_hist mtp_hist "$MTP_RECENT"
-    else
-        push_hist mtp_hist 0
-    fi
-
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
     # Render
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
 
     clear_screen
 
@@ -818,162 +826,187 @@ while true; do
     echo " llamatop — Jan / llama.cpp                    $(date '+%Y-%m-%d %H:%M:%S')"
     echo "════════════════════════════════════════════════════════════════════════════════"
 
-    printf " Model           %s  [%s]\n" "$MODEL" "$MODEL_MODE"
-    printf " Server          %s\n" "$BASE"
-    printf " State           %s\n" "$REQUEST_STATE"
+    printf " Model             %s  [%s]\n" "$MODEL" "$MODEL_MODE"
+    printf " Server            %s\n" "$BASE"
+    printf " State             %s\n" "$REQUEST_STATE"
 
     echo
-    echo "──────────────────────────────── THROUGHPUT ────────────────────────────────────"
+    echo "────────────────────────────── LIVE REQUEST ────────────────────────────────────"
 
-    printf " Generation live %9.2f tok/s   " "$GEN_LIVE"
-    spark "${gen_live_hist[@]}"
+    printf " Generation live   %9.2f tok/s   " "$GEN_LIVE"
+    spark "${gen_hist[@]}"
     echo
 
-    printf " Generation avg  %9.2f tok/s   (llama.cpp gauge)\n" "$GEN_AVG"
-
-    printf " Prompt live     %9.2f tok/s   " "$PROMPT_LIVE"
-    spark "${prompt_live_hist[@]}"
+    printf " Prompt live       %9.2f tok/s   " "$PROMPT_LIVE"
+    spark "${prompt_hist[@]}"
     echo
 
-    printf " Prompt avg      %9.2f tok/s   (llama.cpp gauge)\n" "$PROMPT_AVG"
+    echo
+
+    printf " Prompt processed  %9s / %-9s tokens\n" \
+        "$SLOT_PROMPT_PROCESSED" \
+        "$SLOT_PROMPT_TOTAL"
+
+    printf " Output generated  %9s tokens this request\n" \
+        "$SLOT_DECODED"
+
+    printf " Sample delta      prompt=+%s  output=+%s  over %.2fs\n" \
+        "$SLOT_PROMPT_DELTA" \
+        "$SLOT_DECODED_DELTA" \
+        "$SAMPLE_DT"
+
+    # --------------------------------------------------------------------------
+    # Aggregate metrics
+    # --------------------------------------------------------------------------
 
     echo
-    printf " Requests        processing=%s  queued=%s\n" \
-        "$PROCESSING" "$DEFERRED"
+    echo "──────────────────────────── /metrics AGGREGATE ────────────────────────────────"
 
-    printf " Tokens          prompt=%s  generated=%s\n" \
-        "$PROMPT_TOTAL" "$GENERATED_TOTAL"
+    printf " Generation avg    %9.2f tok/s   (llama.cpp gauge)\n" \
+        "$GEN_AVG"
 
-    printf " Sample delta    prompt=+%s  generated=+%s  over %.2fs\n" \
-        "$PROMPT_DELTA" "$GENERATED_DELTA" "$SAMPLE_DT"
+    printf " Prompt avg        %9.2f tok/s   (llama.cpp gauge)\n" \
+        "$PROMPT_AVG"
 
-    # ------------------------------------------------------------------------
+    printf " Requests          processing=%s  queued=%s\n" \
+        "$PROCESSING" \
+        "$DEFERRED"
+
+    printf " Completed totals  prompt=%s  generated=%s\n" \
+        "$PROMPT_METRIC_TOTAL" \
+        "$GENERATED_METRIC_TOTAL"
+
+    # --------------------------------------------------------------------------
     # Context
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
 
     echo
     echo "───────────────────────────────── CONTEXT ──────────────────────────────────────"
 
-    printf " High water      %9s / %-9s  %5.1f%%   " \
-        "$CTX_HI" "$SLOT_CTX_MAX" "$CTX_PCT"
+    printf " High water        %9s / %-9s  %5.1f%%   " \
+        "$CTX_HI" \
+        "$SLOT_CTX_MAX" \
+        "$CTX_PCT"
 
     spark "${ctx_hist[@]}"
     echo
 
-    echo "                 largest observed sequence, not exact current KV occupancy"
+    echo "                   largest sequence ever observed, not exact current KV use"
 
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
     # MTP
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
 
     echo
     echo "────────────────────────────────── MTP ─────────────────────────────────────────"
 
     if awk -v d="$DRAFT" 'BEGIN {exit !(d > 0)}'; then
 
-        printf " Acceptance all  %8.1f%%   %s accepted / %s draft\n" \
-            "$MTP_TOTAL" "$ACCEPTED" "$DRAFT"
-
-        printf " Verify steps    %s\n" "$DRAFT_STEPS"
-
-        if [[ "$MTP_RECENT" != "-" ]]; then
-            printf " Acceptance live %8s%%   " "$MTP_RECENT"
-            spark "${mtp_hist[@]}"
-            echo
-
-            printf " Sample delta    +%s accepted / +%s draft\n" \
-                "$ACCEPTED_DELTA" "$DRAFT_DELTA"
-        else
-            echo " Acceptance live        -"
-        fi
+        printf " Acceptance        %8.1f%%\n" "$MTP_TOTAL"
+        printf " Accepted          %s\n" "$ACCEPTED"
+        printf " Draft tokens      %s\n" "$DRAFT"
+        printf " Verify steps      %s\n" "$DRAFT_STEPS"
+        echo "                   aggregate/completed-request metrics"
 
     else
-        echo " No speculative tokens recorded yet."
+        echo " No completed speculative-token statistics yet."
     fi
 
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
     # Slots
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
 
     echo
     echo "────────────────────────────────── SLOTS ───────────────────────────────────────"
 
-    printf "%-4s %-8s %-7s %-9s %-6s %-8s %-8s %-8s %-7s %-7s %-7s\n" \
+    printf "%-4s %-8s %-7s %-8s %-6s %-8s %-8s %-8s %-6s %-6s %-6s\n" \
         "ID" \
         "STATE" \
         "TASK" \
-        "CTX CAP" \
+        "CTX" \
         "SPEC" \
+        "PROMPT" \
         "DECODED" \
         "REMAIN" \
-        "MAXOUT" \
         "TEMP" \
         "TOP_P" \
         "NMAX"
 
-    printf '%*s\n' 94 '' | tr ' ' '-'
+    printf '%*s\n' 91 '' | tr ' ' '-'
 
-jq -r '
-    def nt:
-        if (.next_token | type) == "array" then
-            (.next_token[0] // {})
-        elif (.next_token | type) == "object" then
-            .next_token
-        else
-            {}
-        end;
+    jq -r '
+        def nt:
+            if (.next_token | type) == "array" then
+                (.next_token[0] // {})
+            elif (.next_token | type) == "object" then
+                .next_token
+            else
+                {}
+            end;
 
-    def r3:
-        if type == "number"
-        then ((. * 1000 | round) / 1000)
-        else .
-        end;
+        def r3:
+            if type == "number"
+            then ((. * 1000 | round) / 1000)
+            else .
+            end;
 
-    .[] |
+        .[] |
 
-    [
-        (.id // "?"),
+        [
+            (.id // "?"),
 
-        (
-            if .is_processing
-            then "RUNNING"
-            else "idle"
-            end
-        ),
+            (
+                if .is_processing
+                then "RUNNING"
+                else "idle"
+                end
+            ),
 
-        (.id_task // "-"),
+            (.id_task // "-"),
+            (.n_ctx // "-"),
 
-        (.n_ctx // "-"),
+            (
+                if .speculative
+                then "yes"
+                else "no"
+                end
+            ),
 
-        (
-            if .speculative
-            then "yes"
-            else "no"
-            end
-        ),
+            (
+                (
+                    (.n_prompt_tokens_processed // 0)
+                    | tostring
+                )
+                +
+                "/"
+                +
+                (
+                    (.n_prompt_tokens // 0)
+                    | tostring
+                )
+            ),
 
-        (nt | .n_decoded // 0),
+            (nt | .n_decoded // 0),
+            (nt | .n_remain // "-"),
 
-        (nt | .n_remain // "-"),
+            (
+                (.params.temperature // "-")
+                | r3
+            ),
 
-        (
-            .params.max_tokens
-            // .params.n_predict
-            // "-"
-        ),
+            (
+                (.params.top_p // "-")
+                | r3
+            ),
 
-        (.params.temperature // "-" | r3),
+            (
+                .params["speculative.n_max"]
+                // "-"
+            )
+        ]
 
-        (.params.top_p // "-" | r3),
-
-        (
-            .params["speculative.n_max"]
-            // "-"
-        )
-    ]
-
-    | @tsv
-' <<< "$SLOTS" |
+        | @tsv
+    ' <<< "$SLOTS" |
 
     while IFS=$'\t' read -r \
         id \
@@ -981,37 +1014,43 @@ jq -r '
         task \
         ctx \
         spec \
+        prompt \
         decoded \
         remain \
-        maxout \
         temp \
         topp \
         nmax
     do
 
-        printf "%-4s %-8s %-7s %-9s %-6s %-8s %-8s %-8s %-7s %-7s %-7s\n" \
+        printf "%-4s %-8s %-7s %-8s %-6s %-8s %-8s %-8s %-6s %-6s %-6s\n" \
             "$id" \
             "$state" \
             "$task" \
             "$ctx" \
             "$spec" \
+            "$prompt" \
             "$decoded" \
             "$remain" \
-            "$maxout" \
             "$temp" \
             "$topp" \
             "$nmax"
     done
 
-    # ------------------------------------------------------------------------
-    # Active slot parameters
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # Active slot details
+    # --------------------------------------------------------------------------
 
     echo
     echo "──────────────────────────── ACTIVE SLOT DETAILS ───────────────────────────────"
 
     ACTIVE_DETAILS="$(
         jq -r '
+            def r3:
+                if type == "number"
+                then ((. * 1000 | round) / 1000)
+                else .
+                end;
+
             .[]
             | select(.is_processing == true)
 
@@ -1019,11 +1058,11 @@ jq -r '
 
             "slot \(.id): " +
 
-            "min_p=\(.params.min_p // "-")  " +
+            "min_p=\((.params.min_p // "-") | r3)  " +
             "top_k=\(.params.top_k // "-")  " +
             "reasoning=\(.params.reasoning_format // "-")  " +
             "spec_nmin=\(.params["speculative.n_min"] // "-")  " +
-            "spec_pmin=\(.params["speculative.p_min"] // "-")"
+            "spec_pmin=\((.params["speculative.p_min"] // "-") | r3)"
         ' <<< "$SLOTS"
     )"
 
@@ -1033,75 +1072,28 @@ jq -r '
         echo "(no active request)"
     fi
 
-    # ------------------------------------------------------------------------
-    # All parsed /metrics
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # All metrics
+    # --------------------------------------------------------------------------
 
     if [[ "$SHOW_ALL_METRICS" == "1" ]]; then
 
         echo
         echo "────────────────────────────── ALL /metrics ───────────────────────────────────"
 
-        printf "%-68s %14s %3s %12s %12s\n" \
+        printf "%-68s %14s\n" \
             "METRIC" \
-            "VALUE" \
-            "" \
-            "DELTA" \
-            "RATE/s"
+            "VALUE"
 
-        printf '%*s\n' 113 '' | tr ' ' '-'
+        printf '%*s\n' 84 '' | tr ' ' '-'
 
         while IFS= read -r key; do
             [[ -z "$key" ]] && continue
 
-            val="${curr[$key]}"
+            printf "%-68.68s %14.6g\n" \
+                "$key" \
+                "${curr[$key]}"
 
-            if [[ -n "${prev[$key]+x}" ]]; then
-                old="${prev[$key]}"
-
-                read -r delta rate arrow <<< "$(
-                    awk \
-                        -v new="$val" \
-                        -v old="$old" \
-                        -v interval="$SAMPLE_DT" '
-                    BEGIN {
-                        d = new-old
-
-                        if (d > 0)
-                            arrow="↑"
-                        else if (d < 0)
-                            arrow="↓"
-                        else
-                            arrow="→"
-
-                        if (d < 0 && old > 0) {
-                            printf "reset reset ↺"
-                        } else {
-                            if (interval <= 0)
-                                interval=1
-
-                            printf "%.5g %.5g %s", \
-                                d, d/interval, arrow
-                        }
-                    }'
-                )"
-
-                printf "%-68.68s %14.6g %3s %12s %12s\n" \
-                    "$key" \
-                    "$val" \
-                    "$arrow" \
-                    "$delta" \
-                    "$rate"
-
-            else
-
-                printf "%-68.68s %14.6g %3s %12s %12s\n" \
-                    "$key" \
-                    "$val" \
-                    "·" \
-                    "-" \
-                    "-"
-            fi
         done < <(
             printf '%s\n' "${!curr[@]}" |
             sort
@@ -1109,17 +1101,7 @@ jq -r '
     fi
 
     echo
-    echo " q = quit    |    --raw = exact endpoint dump"
-
-    # ------------------------------------------------------------------------
-    # Save sample
-    # ------------------------------------------------------------------------
-
-    prev=()
-
-    for key in "${!curr[@]}"; do
-        prev["$key"]="${curr[$key]}"
-    done
+    echo " q = quit   |   --raw = exact endpoint bodies"
 
     responsive_sleep "$INTERVAL"
 done
