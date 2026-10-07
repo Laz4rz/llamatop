@@ -92,6 +92,7 @@ With multiple loaded models, the dashboard prefers one with an active slot. When
 | **Prompt cached/reused** | The explicit `n_prompt_tokens_cache` field, when provided. |
 | **Decode / prefill average** | llama.cpp's aggregate throughput gauges from `/metrics`, rather than live rates. |
 | **MTP** | Aggregate speculative decoding acceptance and draft counters. Availability depends on the server build; updates may wait until request completion. |
+| **All /metrics: Δ / poll** | Signed change since the previous poll: `↑` increased, `↓` decreased, `→` unchanged. `n/a` marks a new baseline after startup, a model switch, or a missing sample. These are reported metric changes, not live token rates. |
 
 **Context already includes generated tokens.** `n_decoded` is never added to `n_prompt_tokens`.
 

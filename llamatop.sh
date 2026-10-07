@@ -380,6 +380,7 @@ present_frame() {
 # ==============================================================================
 
 declare -A curr=()
+declare -A prev_metrics=()
 
 gen_hist=()
 prompt_hist=()
@@ -503,6 +504,30 @@ spark() {
 metric() {
     local name="$1"
     printf '%s' "${curr[$name]:-n/a}"
+}
+
+# Raw changes in reported metrics, never a source of live token throughput.
+metrics_table() {
+    local key
+    printf '%-50s %12s    %10s\n' 'METRIC' 'VALUE' 'Δ / poll'
+    {
+        for key in "${!curr[@]}"; do
+            printf '%s\t%s\t%s\n' "$key" "${curr[$key]}" "${prev_metrics[$key]:-n/a}"
+        done
+    } | LC_ALL=C sort | awk -F '\t' '
+        {
+            arrow="·"
+            delta="n/a"
+            if ($3 != "n/a") {
+                change=$2-$3
+                if (change > 0) { arrow="↑"; delta=sprintf("+%.6g", change) }
+                else if (change < 0) { arrow="↓"; delta=sprintf("%.6g", change) }
+                else { arrow="→"; delta="0" }
+            }
+            printf "%-50s %12.6g  %s %10s\n", $1, $2, arrow, delta
+        }
+    '
+    echo ' Δ / poll = change since previous poll; n/a = no comparable sample.'
 }
 
 format_number() {
@@ -734,6 +759,7 @@ while true; do
             echo 'q = quit'
             )"
             publish_frame "$FRAME"
+            curr=()
             prev_slots='[]'
             last_sample_ts=""
             sleep "$INTERVAL"
@@ -753,6 +779,7 @@ while true; do
         echo 'Waiting...  q = quit'
         )"
         publish_frame "$FRAME"
+        curr=()
         prev_slots='[]'
         last_sample_ts=""
         sleep "$INTERVAL"
@@ -818,6 +845,12 @@ while true; do
     fi
     last_sample_ts="$NOW_TS"
 
+    # Keep only the immediately preceding sample. Missing endpoints/metrics
+    # or a model change start a fresh baseline instead of spanning a gap.
+    prev_metrics=()
+    for key in "${!curr[@]}"; do
+        prev_metrics["$key"]="${curr[$key]}"
+    done
     curr=()
     if [[ "$METRICS_OK" == "1" ]]; then
         while IFS= read -r line; do
@@ -1030,11 +1063,7 @@ while true; do
     if [[ "$SHOW_ALL_METRICS" == "1" ]]; then
         echo
         echo '────────────────────────────── ALL /metrics ───────────────────────────────────'
-        printf '%-68s %14s\n' 'METRIC' 'VALUE'
-        while IFS= read -r key; do
-            [[ -z "$key" ]] && continue
-            printf '%-68.68s %14.6g\n' "$key" "${curr[$key]}"
-        done < <(printf '%s\n' "${!curr[@]}" | sort)
+        metrics_table
     fi
 
     [[ "$MODELS_OK" == "0" ]] && endpoint_error "$BASE/models" "$MODELS_CODE" "$MODELS_ERROR" "$MODELS"
